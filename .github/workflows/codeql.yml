@@ -34,7 +34,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3
+        uses: github/codeql-action/init@v4
         with:
           languages: ${{ matrix.language }}
           # `security-extended` adds higher-signal queries beyond
@@ -47,9 +47,9 @@ jobs:
         # Pure-Python — autobuild is a no-op but kept here so the
         # workflow doesn't need editing if a compiled extension
         # is added later.
-        uses: github/codeql-action/autobuild@v3
+        uses: github/codeql-action/autobuild@v4
 
       - name: Analyze
-        uses: github/codeql-action/analyze@v3
+        uses: github/codeql-action/analyze@v4
         with:
           category: "/language:${{ matrix.language }}"
