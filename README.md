@@ -166,6 +166,8 @@ Event stream (each is a JSON `data:` payload):
 | `tool_use` | `{ "id", "name", "input" }` |
 | `tool_result` | `{ "id", "content" }` |
 | `tool_error` | `{ "id", "name", "error" }` |
+| `validation` | `{ "method", "passed", "citations_total", "citations_verified", "issues", "auditor_used", "auditor_model" }` (only when `validation_mode != "off"`) |
+| `validation_retry` | `{ "retries_remaining", "feedback_preview" }` (when an auto-retry fires) |
 | `turn_complete` | `{ "stop_reason", ... }` |
 
 The client appends user / assistant / tool blocks to its in-memory
@@ -197,6 +199,136 @@ rejects `cachePoint` blocks. The history shape passed to the provider
 adapter is *not* mutated — caching markers are inserted into a
 shallow-copied request and the caller's `history` list keeps its
 provider-neutral form for use across turns and adapters.
+
+## Hybrid response validation
+
+LLMs occasionally invent numbers that look reasonable — a dollar
+amount that's off by a hundred, a date that's a year ahead, an ID
+that doesn't exist. When tool calls are involved, the data was
+*right there in the prompt* and the model still got it wrong. This
+client ships an opt-in two-layer validation pipeline that catches
+those before the user sees them.
+
+### Enable it
+
+```python
+from ai_assistant_client.agent import AgentRunConfig, run_agent
+from ai_assistant_client.llm import make_provider
+
+config = AgentRunConfig(
+    validation_mode="hybrid",      # "off" | "citation" | "audit" | "hybrid"
+    citation_strictness="permissive",  # or "strict"
+    max_validation_retries=2,      # 0 = emit-only, no retry
+    # auditor_model="claude-haiku-4-5-20251001",  # optional override
+)
+
+provider = make_provider("anthropic")
+async for event in run_agent(
+    user_message="...",
+    history=history,
+    registry=registry,
+    dispatcher=dispatcher,
+    provider=provider,
+    config=config,
+    provider_name="anthropic",      # used to pick the default auditor model
+    # auditor_provider=provider,    # defaults to the primary; pass a separate
+                                    # LLMProvider if you want the auditor to
+                                    # use a different vendor / region / key
+):
+    ...
+```
+
+The default — `validation_mode="off"` — is a no-op; existing callers
+see zero behavior change.
+
+### How each mode works
+
+| Mode | Citation check | Auditor LLM | Cost | When to pick |
+|---|---|---|---|---|
+| `off` | — | — | $0 | Default; you accept some risk in exchange for cost + latency. |
+| `citation` | ✅ on every turn | — | $0 | Best price/perf. Catches hallucinated *cited* values; misses uncited claims. |
+| `audit` | — | ✅ on every turn | ~2× per-turn | No model-side burden. Catches semantic errors but doubles cost + latency. |
+| `hybrid` | ✅ on every turn | ✅ only when citation fails | ~1.05× typical | **Recommended.** Cheap when the model gets it right; intelligent fallback when it doesn't. |
+
+### Citation grammar
+
+When validation is on, the system prompt is augmented to ask the
+model to cite tool-derived values in this exact form:
+
+```
+You owe <cite tu="tu_1" path="$.invoices[2].amount">$1,250.00</cite>
+across <cite tu="tu_1" path="$.invoices|length">3</cite> invoices.
+```
+
+The verifier then resolves the JSONPath against the actual
+`tool_result` content and compares the displayed value to the data
+using type-aware normalization (currency: `"$1,250.00"` ↔ `1250.0`;
+dates: `"March 15, 2026"` ↔ `"2026-03-15T..."`; counts, percentages,
+IDs, strings, booleans). The JSONPath subset supports `$.foo`,
+`$.foo[0]`, `$.foo[*]`, `$.foo[?(@.id==42)]`, and the filters
+`|length`, `|sum`, `|count` — enough for typical agent reasoning,
+no third-party dependency.
+
+### What happens when validation fails
+
+```
+turn ends → run_validation → emit AgentEvent("validation", ...)
+                          ↳ if passed or retries==0: emit turn_complete (done)
+                          ↳ otherwise:
+                               append synthetic user-message to history
+                                 with: feedback + "OK to not know" reminder
+                               emit AgentEvent("validation_retry", ...)
+                               re-run the assistant turn
+```
+
+The "OK to not know" reminder explicitly tells the model that
+*acknowledging uncertainty is always better than guessing* — pushing
+it away from the doubling-down failure mode that naive retry loops
+can otherwise reinforce.
+
+The retry budget is hard-capped (`max_validation_retries`, default
+`2`). After it's exhausted the agent yields `turn_complete` with the
+final `validation` event still showing failures — the host decides
+whether to render the response, hide it, or surface a warning.
+
+### Issue kinds the verifier produces
+
+| Kind | Source | Severity | Meaning |
+|---|---|---|---|
+| `value_mismatch` | citation | error | Path resolved, but the displayed value doesn't match the data. |
+| `broken_citation` | citation | error | The `path` doesn't resolve in the cited tool_result. |
+| `unknown_tool_use_id` | citation | error | The `tu` attribute doesn't match any tool_result in history. |
+| `non_json_substring_miss` | citation | warning | Tool result was free text; displayed value isn't a substring. |
+| `auditor_finding` | auditor | error/warning | The auditor LLM flagged a claim. |
+| `auditor_unavailable` | auditor | warning | Auditor was needed but no provider was configured. |
+
+### Configuration reference
+
+| Field on `AgentRunConfig` | Default | Purpose |
+|---|---|---|
+| `validation_mode` | `"off"` | `"off"` \| `"citation"` \| `"audit"` \| `"hybrid"`. |
+| `citation_strictness` | `"permissive"` | `"strict"` treats any uncited concrete value as a failure (and triggers the auditor in hybrid mode). |
+| `auditor_model` | provider default | Override the auditor model. Defaults: Anthropic → `claude-haiku-4-5`, OpenAI → `gpt-4o-mini`, Gemini → `gemini-2.0-flash-lite`, Bedrock → Haiku-on-Bedrock. |
+| `max_validation_retries` | `2` | `0` = emit the validation event, never retry. |
+
+### Event payloads
+
+```json
+event: validation
+data: {"method":"hybrid","passed":false,"citations_total":2,
+       "citations_verified":1,"auditor_used":true,
+       "auditor_model":"claude-haiku-4-5-20251001",
+       "issues":[{"kind":"value_mismatch","severity":"error",
+                  "claim":"$9,999.00","reason":"...","source":"citation",
+                  "tool_use_id":"tu_1","path":"$.amount","expected":1250.0}]}
+
+event: validation_retry
+data: {"retries_remaining":1,"feedback_preview":"[validation] Your previous response..."}
+```
+
+Hosts that don't care about validation can simply ignore both events
+— the `text_delta` / `tool_use` / `tool_result` / `turn_complete`
+stream is unchanged.
 
 ## Configuration
 
