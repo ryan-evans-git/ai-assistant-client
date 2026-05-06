@@ -18,6 +18,7 @@ import os
 from typing import Any, AsyncIterator
 
 from ai_assistant_client.llm.base import (
+    CacheHint,
     LLMProvider,
     MessageStop,
     NormalizedEvent,
@@ -52,7 +53,15 @@ class GeminiProvider(LLMProvider):
         system: str,
         tools: list[dict[str, Any]],
         messages: list[dict[str, Any]],
+        cache_hint: CacheHint | None = None,
     ) -> AsyncIterator[NormalizedEvent]:
+        # Gemini 2.5+ supports implicit context caching automatically
+        # for repeated prefixes — no API change required.  The explicit
+        # ``client.caches.create()`` API exists for long-lived prefixes
+        # but adds resource-lifecycle work that's out of scope here.
+        # We accept ``cache_hint`` for interface symmetry but don't act
+        # on it.
+        del cache_hint
         from google.genai import types as genai_types  # type: ignore[import-not-found]
 
         contents = _to_gemini_contents(messages)

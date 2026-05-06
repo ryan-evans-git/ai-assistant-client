@@ -17,6 +17,7 @@ import json
 from typing import Any, AsyncIterator
 
 from ai_assistant_client.llm.base import (
+    CacheHint,
     LLMProvider,
     MessageStop,
     NormalizedEvent,
@@ -48,7 +49,14 @@ class OpenAIProvider(LLMProvider):
         system: str,
         tools: list[dict[str, Any]],
         messages: list[dict[str, Any]],
+        cache_hint: CacheHint | None = None,
     ) -> AsyncIterator[NormalizedEvent]:
+        # OpenAI prompt caching is automatic for prompts ≥1024 tokens —
+        # no API change required.  Cached-token usage shows up in
+        # ``response.usage.prompt_tokens_details.cached_tokens``.  We
+        # accept ``cache_hint`` for interface symmetry but don't act
+        # on it.
+        del cache_hint
         oa_messages = [{"role": "system", "content": system}, *_to_openai_messages(messages)]
         oa_tools = [_to_openai_tool(t) for t in tools] if tools else None
 

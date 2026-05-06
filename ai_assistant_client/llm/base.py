@@ -90,10 +90,51 @@ class LLMProvider(ABC):
         system: str,
         tools: list[dict[str, Any]],
         messages: list[dict[str, Any]],
+        cache_hint: "CacheHint | None" = None,
     ) -> AsyncIterator[NormalizedEvent]:
         """Stream one assistant turn.  Returns an async iterator of
         normalized events.  The caller is responsible for re-invoking
         this after appending tool_result messages, until a
         ``MessageStop`` with ``stop_reason != "tool_use"`` is seen.
+
+        ``cache_hint`` is an opt-in request to use the provider's
+        prompt-caching feature.  Adapters that support it (Anthropic,
+        Bedrock) translate the hint into native cache markers.
+        Providers with automatic caching (OpenAI, Gemini 2.5+) ignore
+        the hint and rely on the platform default.  Passing ``None``
+        disables caching universally.
         """
         raise NotImplementedError
+
+
+@dataclass
+class CacheHint:
+    """A request to mark cache breakpoints in the next ``stream_turn``.
+
+    The hint is *advisory* — adapters honor it on a best-effort basis
+    using the most cost-effective breakpoints the provider exposes.
+    The intent is to cache the conversation prefix that's stable across
+    turns (system prompt, tool catalog, completed messages) so each
+    follow-up turn pays a fraction of the input cost for re-reading it.
+
+    Attributes
+    ----------
+    cache_system:
+        Cache the system prompt as its own breakpoint.
+    cache_tools:
+        Cache the serialized tool catalog as its own breakpoint.
+    cache_history_through_index:
+        Index into ``messages`` (inclusive) marking the last message
+        that should be inside the cached prefix.  ``None`` means
+        "don't cache the messages array."  ``-1`` is shorthand for
+        "everything except the in-flight last message."
+
+        The index is adapter-translated to whatever native marker the
+        provider uses (Anthropic ``cache_control`` on the last block of
+        that message, Bedrock ``cachePoint`` content block appended
+        after it, etc.).
+    """
+
+    cache_system: bool = True
+    cache_tools: bool = True
+    cache_history_through_index: int | None = -1

@@ -172,6 +172,32 @@ The client appends user / assistant / tool blocks to its in-memory
 history during the stream. Persist `history` between turns by passing
 the prior turns back in the next `POST /chat` body.
 
+## Prompt caching
+
+Long conversations with progressive tool discovery accumulate a sizable
+stable prefix — the system prompt, the loaded tool catalog, and every
+prior turn. Re-sending it on every turn at full input cost adds up
+fast.
+
+`AgentRunConfig.enable_prompt_caching` (default **on**) opts each
+turn into the provider's prompt-caching feature:
+
+- **Anthropic** — adds `cache_control: ephemeral` markers to the system
+  prompt, the tool catalog, and the most recent completed message. The
+  cached prefix is re-read at ~10% of the input cost (5-minute TTL).
+- **Bedrock** — equivalent `{cachePoint}` blocks at the same logical
+  points. Note: not every Bedrock-hosted model supports caching;
+  Anthropic models do.
+- **OpenAI** — automatic for prompts ≥1024 tokens. The flag is
+  accepted for interface symmetry but the adapter doesn't act on it.
+- **Gemini 2.5+** — implicit caching is on by default. Same story.
+
+Turn the flag off when cost-debugging or if your target Bedrock model
+rejects `cachePoint` blocks. The history shape passed to the provider
+adapter is *not* mutated — caching markers are inserted into a
+shallow-copied request and the caller's `history` list keeps its
+provider-neutral form for use across turns and adapters.
+
 ## Configuration
 
 | Variable | Default | Purpose |
