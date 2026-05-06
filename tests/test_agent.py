@@ -18,6 +18,7 @@ from ai_assistant_client.discovery import (
     RemoteToolDescriptor,
 )
 from ai_assistant_client.llm import (
+    CacheHint,
     LLMProvider,
     MessageStop,
     NormalizedEvent,
@@ -49,6 +50,7 @@ class _StubProvider(LLMProvider):
         system: str,
         tools: list[dict[str, Any]],
         messages: list[dict[str, Any]],
+        cache_hint: CacheHint | None = None,
     ) -> AsyncIterator[NormalizedEvent]:
         self.calls.append(
             {
@@ -57,6 +59,7 @@ class _StubProvider(LLMProvider):
                 "system": system,
                 "tools": tools,
                 "messages": [m for m in messages],
+                "cache_hint": cache_hint,
             }
         )
         events = (
@@ -248,6 +251,59 @@ async def test_dispatcher_error_surfaces_as_tool_result_error() -> None:
     tool_errors = [e for e in events if e.type == "tool_error"]
     assert len(tool_errors) == 1
     assert "upstream is down" in tool_errors[0].data["error"]
+
+
+@pytest.mark.asyncio
+async def test_cache_hint_emitted_when_history_has_prior_turns() -> None:
+    """When the user turn isn't the very first message, the agent
+    should pass a CacheHint pointing at the last completed message."""
+    provider = _StubProvider([_text_only_turn("ack")])
+    registry = ProgressiveToolRegistry([])
+    history = [
+        {"role": "user", "content": "earlier"},
+        {"role": "assistant", "content": [{"type": "text", "text": "earlier reply"}]},
+    ]
+
+    async def dispatcher(name: str, arguments: dict[str, Any]) -> Any:
+        raise AssertionError("not used")
+
+    async for _ in run_agent(
+        user_message="follow up",
+        history=history,
+        registry=registry,
+        dispatcher=dispatcher,
+        provider=provider,
+        config=AgentRunConfig(),
+    ):
+        pass
+
+    assert len(provider.calls) == 1
+    hint = provider.calls[0]["cache_hint"]
+    assert hint is not None
+    # history at call time is [earlier-user, earlier-asst, follow-up-user] = len 3,
+    # so the cached prefix points to index 1 (the earlier assistant turn).
+    assert hint.cache_history_through_index == 1
+
+
+@pytest.mark.asyncio
+async def test_cache_hint_disabled_when_caching_off() -> None:
+    provider = _StubProvider([_text_only_turn("ack")])
+    registry = ProgressiveToolRegistry([])
+
+    async def dispatcher(name: str, arguments: dict[str, Any]) -> Any:
+        raise AssertionError("not used")
+
+    async for _ in run_agent(
+        user_message="hi",
+        history=[{"role": "user", "content": "x"}, {"role": "assistant", "content": [{"type": "text", "text": "y"}]}],
+        registry=registry,
+        dispatcher=dispatcher,
+        provider=provider,
+        config=AgentRunConfig(enable_prompt_caching=False),
+    ):
+        pass
+
+    assert provider.calls[0]["cache_hint"] is None
 
 
 @pytest.mark.asyncio

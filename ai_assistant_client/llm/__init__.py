@@ -9,6 +9,7 @@ The default model for each provider can be overridden with
 from __future__ import annotations
 
 from ai_assistant_client.llm.base import (
+    CacheHint,
     LLMProvider,
     MessageStop,
     NormalizedEvent,
@@ -59,6 +60,7 @@ def default_model(provider_name: str) -> str:
 
 
 __all__ = [
+    "CacheHint",
     "LLMProvider",
     "MessageStop",
     "NormalizedEvent",

@@ -20,6 +20,7 @@ from typing import Any, AsyncIterator, Awaitable, Callable
 
 from ai_assistant_client.discovery import ProgressiveToolRegistry
 from ai_assistant_client.llm import (
+    CacheHint,
     LLMProvider,
     MessageStop,
     TextDelta,
@@ -59,6 +60,12 @@ class AgentRunConfig:
         "directly callable for the rest of the conversation."
     )
     max_tool_iterations: int = 16
+    # Opt in to provider-level prompt caching.  Anthropic + Bedrock
+    # honor this by marking the system prompt, tool catalog, and last
+    # completed message as a cached prefix; subsequent turns re-read
+    # that prefix at ~10% of the input cost (5-minute TTL).  OpenAI
+    # and Gemini 2.5+ cache automatically and ignore the flag.
+    enable_prompt_caching: bool = True
 
 
 async def run_agent(
@@ -99,12 +106,27 @@ async def run_agent(
         partial_inputs: dict[int, str] = {}
         stop_reason: str | None = None
 
+        # Build the cache hint for this turn.  We cache the system
+        # prompt, the tool catalog, and the most recently *completed*
+        # message in history.  The in-flight last message (the user
+        # turn we just appended, or the most recent tool_result block)
+        # is intentionally left uncached so each new turn forms a
+        # fresh suffix beyond the cached prefix.  Anthropic supports
+        # up to 4 cache breakpoints per request — three is well within
+        # budget.
+        cache_hint = (
+            CacheHint(cache_history_through_index=len(history) - 2)
+            if config.enable_prompt_caching and len(history) >= 2
+            else None
+        )
+
         async for event in provider.stream_turn(
             model=config.model,
             max_tokens=config.max_tokens,
             system=config.system_prompt,
             tools=tools,
             messages=history,
+            cache_hint=cache_hint,
         ):
             if isinstance(event, TextDelta):
                 if event.text:

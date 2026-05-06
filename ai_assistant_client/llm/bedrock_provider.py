@@ -17,6 +17,7 @@ import json
 from typing import Any, AsyncIterator
 
 from ai_assistant_client.llm.base import (
+    CacheHint,
     LLMProvider,
     MessageStop,
     NormalizedEvent,
@@ -48,17 +49,25 @@ class BedrockProvider(LLMProvider):
         system: str,
         tools: list[dict[str, Any]],
         messages: list[dict[str, Any]],
+        cache_hint: CacheHint | None = None,
     ) -> AsyncIterator[NormalizedEvent]:
+        bedrock_messages = _to_bedrock_messages(messages)
+        bedrock_system = [{"text": system}] if system else []
+        bedrock_tools = [_to_bedrock_tool(t) for t in tools] if tools else None
+
+        if cache_hint is not None:
+            bedrock_system, bedrock_tools, bedrock_messages = _apply_cache_points(
+                bedrock_system, bedrock_tools, bedrock_messages, cache_hint
+            )
+
         kwargs: dict[str, Any] = {
             "modelId": model,
-            "messages": _to_bedrock_messages(messages),
-            "system": [{"text": system}] if system else [],
+            "messages": bedrock_messages,
+            "system": bedrock_system,
             "inferenceConfig": {"maxTokens": max_tokens},
         }
-        if tools:
-            kwargs["toolConfig"] = {
-                "tools": [_to_bedrock_tool(t) for t in tools],
-            }
+        if bedrock_tools:
+            kwargs["toolConfig"] = {"tools": bedrock_tools}
 
         response = await asyncio.to_thread(self._client.converse_stream, **kwargs)
         stream = response["stream"]
@@ -199,3 +208,54 @@ def _normalize_stop(reason: str) -> str:
     if reason in ("end_turn", "stop_sequence"):
         return "end_turn"
     return reason or "end_turn"
+
+
+# ---------------------------------------------------------------------------
+# Prompt caching translation
+# ---------------------------------------------------------------------------
+
+# Bedrock Converse uses inline ``cachePoint`` content blocks rather than
+# block-level markers (the Anthropic style).  A ``cachePoint`` is a
+# zero-content separator that means "everything before me in this array
+# is part of one cached prefix."  We append them after the system,
+# tool, and selected-message blocks the caller asked us to cache.
+#
+# Caveats: not every Bedrock model supports caching (Claude 3.5 Sonnet
+# and friends do; older or non-Anthropic models will fail with a
+# ValidationException).  Adapters can't tell which model the caller
+# is using safely, so we honor the hint regardless and rely on the
+# caller to disable caching when their target model doesn't support it.
+
+_CACHE_POINT_BLOCK: dict[str, Any] = {"cachePoint": {"type": "default"}}
+
+
+def _apply_cache_points(
+    bedrock_system: list[dict[str, Any]],
+    bedrock_tools: list[dict[str, Any]] | None,
+    bedrock_messages: list[dict[str, Any]],
+    hint: CacheHint,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]] | None, list[dict[str, Any]]]:
+    """Insert ``cachePoint`` blocks into the request payload."""
+    out_system = bedrock_system
+    if hint.cache_system and bedrock_system:
+        out_system = [*bedrock_system, _CACHE_POINT_BLOCK]
+
+    out_tools = bedrock_tools
+    if hint.cache_tools and bedrock_tools:
+        # Bedrock's ``toolConfig.tools`` accepts ``cachePoint`` entries
+        # alongside ``toolSpec`` entries — appending one after the
+        # tool list caches the whole catalog as a single prefix.
+        out_tools = [*bedrock_tools, _CACHE_POINT_BLOCK]
+
+    out_messages = bedrock_messages
+    idx = hint.cache_history_through_index
+    if idx is not None and bedrock_messages:
+        target = idx if idx >= 0 else len(bedrock_messages) + idx
+        if 0 <= target < len(bedrock_messages):
+            out_messages = [dict(m) for m in bedrock_messages]
+            msg = out_messages[target]
+            content = list(msg.get("content") or [])
+            content.append(_CACHE_POINT_BLOCK)
+            out_messages[target] = {**msg, "content": content}
+
+    return out_system, out_tools, out_messages
