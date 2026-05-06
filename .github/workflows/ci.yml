@@ -77,7 +77,7 @@ jobs:
         # uploaded to the security tab when the workflow has
         # `security-events: write` (added at the workflow level
         # below for the SARIF-uploading jobs).
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: fs
           scan-ref: .
@@ -89,7 +89,7 @@ jobs:
       - name: Trivy Dockerfile scan
         # Lints the Dockerfile for misconfig (root user, missing
         # HEALTHCHECK, etc.) before any image is even built.
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: config
           scan-ref: Dockerfile
