@@ -166,6 +166,8 @@ Event stream (each is a JSON `data:` payload):
 | `tool_use` | `{ "id", "name", "input" }` |
 | `tool_result` | `{ "id", "content" }` |
 | `tool_error` | `{ "id", "name", "error" }` |
+| `validation` | `{ "method", "passed", "citations_total", "citations_verified", "issues", "auditor_used", "auditor_model" }` (only when `validation_mode != "off"`) |
+| `validation_retry` | `{ "retries_remaining", "feedback_preview" }` (when an auto-retry fires) |
 | `turn_complete` | `{ "stop_reason", ... }` |
 
 The client appends user / assistant / tool blocks to its in-memory
@@ -197,6 +199,62 @@ rejects `cachePoint` blocks. The history shape passed to the provider
 adapter is *not* mutated — caching markers are inserted into a
 shallow-copied request and the caller's `history` list keeps its
 provider-neutral form for use across turns and adapters.
+
+## Hybrid response validation
+
+LLMs sometimes hallucinate values that look right but don't exist in
+the tool data they retrieved. To catch this before the user sees it,
+the client supports an opt-in two-layer validation pipeline:
+
+1. **Citation tracing (deterministic).** The system prompt asks the
+   model to wrap any tool-derived value in an inline citation tag:
+
+   ```
+   You owe <cite tu="tu_1" path="$.invoices[2].amount">$1,250.00</cite>.
+   ```
+
+   After each turn, a post-processor parses every `<cite>`, evaluates
+   the JSONPath against the matching `tool_result`, and verifies that
+   the displayed value matches the data with type-aware normalization
+   (currency, dates, counts, percentages, IDs, strings, booleans).
+   No second LLM call required.
+
+2. **Auditor LLM (semantic).** When the citation pass flags an issue,
+   a second LLM with an auditor system prompt is given the response +
+   the relevant tool results and asked to identify any unsupported
+   claim. Defaults to the cheapest model in the primary provider's
+   family (Haiku, gpt-4o-mini, gemini-2.0-flash-lite, Haiku-on-Bedrock).
+
+3. **Auto-retry with an "OK to not know" reminder.** When validation
+   fails and retries remain, a synthetic feedback user-message is
+   appended to history asking the model to revise — and explicitly
+   reminding it that *acknowledging uncertainty is always better than
+   guessing*. This pushes the model away from the doubling-down
+   failure mode that retries can otherwise reinforce.
+
+Configure on `AgentRunConfig`:
+
+| Field | Default | Purpose |
+|---|---|---|
+| `validation_mode` | `"off"` | `"off"`, `"citation"`, `"audit"`, or `"hybrid"`. |
+| `citation_strictness` | `"permissive"` | Strict mode treats any uncited concrete value as a failure. |
+| `auditor_model` | provider default | Override the auditor LLM model. |
+| `max_validation_retries` | `2` | `0` disables retries; emit-only. |
+
+A new SSE event surfaces the result:
+
+```json
+event: validation
+data: {"method":"hybrid","passed":false,"citations_total":2,
+       "citations_verified":1,"auditor_used":true,
+       "auditor_model":"claude-haiku-4-5-20251001",
+       "issues":[{"kind":"value_mismatch","severity":"error",
+                  "claim":"$9,999.00","reason":"...","source":"citation",
+                  "tool_use_id":"tu_1","path":"$.amount","expected":1250.0}]}
+```
+
+When a retry kicks in, a `validation_retry` event is also emitted with
+the remaining-budget count and a preview of the feedback message.
 
 ## Configuration
 
