@@ -13,6 +13,12 @@ RUN pip install --upgrade pip && pip install .
 
 COPY ai_assistant_client /app/ai_assistant_client
 
+# Run as non-root. uid 10001 is unprivileged + outside the
+# distro's reserved range (0-999 on Debian-based images).
+RUN groupadd --system --gid 10001 app && \
+    useradd --system --uid 10001 --gid app --no-create-home app
+USER app
+
 ENV AI_ASSISTANT_CLIENT_HOST=0.0.0.0 \
     AI_ASSISTANT_CLIENT_PORT=8080
 
