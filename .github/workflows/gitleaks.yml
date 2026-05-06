@@ -1,0 +1,34 @@
+name: gitleaks
+
+# Scan every push + PR for accidentally committed secrets. The
+# action defaults to the upstream gitleaks ruleset (AWS keys,
+# GitHub tokens, Anthropic / OpenAI / Google keys, generic
+# high-entropy strings, etc.).
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  gitleaks:
+    name: gitleaks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so the scan covers every commit reachable
+          # from the PR head, not just the diff. Without this a
+          # secret introduced and "removed" in the same PR would
+          # slip through.
+          fetch-depth: 0
+
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # `GITLEAKS_LICENSE` is only required for orgs with >25
+          # users. Personal repos don't need it. If an org-wide
+          # license is added later, set it as an org secret.

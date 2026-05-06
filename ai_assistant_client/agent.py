@@ -1,8 +1,13 @@
-"""Streaming chat loop with Claude + progressive MCP tool dispatch.
+"""Streaming chat loop with a pluggable LLM + progressive MCP tool dispatch.
 
-Drives a single user turn from prompt → Claude streaming response
-→ tool-use detection → tool_result → Claude streaming response →
-…until Claude returns a stop_reason that isn't ``tool_use``.
+Drives a single user turn from prompt → LLM streaming response
+→ tool-use detection → tool_result → LLM streaming response →
+…until the LLM returns a stop_reason that isn't ``tool_use``.
+
+The LLM is accessed through :class:`~ai_assistant_client.llm.LLMProvider`,
+which yields a normalized event stream regardless of vendor.  The
+agent loop itself no longer knows or cares whether it's talking to
+Anthropic, OpenAI, Gemini, or Bedrock.
 
 Yields :class:`AgentEvent` instances suitable for SSE serialization.
 """
@@ -14,6 +19,14 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, AsyncIterator, Awaitable, Callable
 
 from ai_assistant_client.discovery import ProgressiveToolRegistry
+from ai_assistant_client.llm import (
+    LLMProvider,
+    MessageStop,
+    TextDelta,
+    ToolInputDelta,
+    ToolUseStart,
+    ToolUseStop,
+)
 
 
 log = logging.getLogger(__name__)
@@ -54,7 +67,7 @@ async def run_agent(
     history: list[dict[str, Any]],
     registry: ProgressiveToolRegistry,
     dispatcher: ToolDispatcher,
-    anthropic_client: Any,  # AsyncAnthropic
+    provider: LLMProvider,
     config: AgentRunConfig,
 ) -> AsyncIterator[AgentEvent]:
     """Run one user turn end-to-end.
@@ -68,6 +81,10 @@ async def run_agent(
     Typically :meth:`McpPool.call_tool`.  Meta-tool calls
     (``tool_search`` / ``tool_load``) are handled inline by the
     registry and never reach the dispatcher.
+
+    History is stored in Anthropic-style block form regardless of
+    which provider is in use; each provider adapter translates on
+    the way out.
     """
     history.append({"role": "user", "content": user_message})
     yield AgentEvent("user_message", {"content": user_message})
@@ -76,75 +93,62 @@ async def run_agent(
         tools = registry.anthropic_tools()
         log.debug("Iteration %d: %d tools in window", iteration, len(tools))
 
-        assistant_blocks: list[dict[str, Any]] = []
-        accumulated_text_by_block_index: dict[int, str] = {}
-        tool_use_blocks: list[dict[str, Any]] = []
-        partial_tool_inputs: dict[int, str] = {}
+        accumulated_text: list[str] = []
+        # tool_use blocks indexed by the provider's stable index.
+        tool_uses: dict[int, dict[str, Any]] = {}
+        partial_inputs: dict[int, str] = {}
         stop_reason: str | None = None
 
-        async with anthropic_client.messages.stream(
+        async for event in provider.stream_turn(
             model=config.model,
             max_tokens=config.max_tokens,
             system=config.system_prompt,
             tools=tools,
             messages=history,
-        ) as stream:
-            async for event in stream:
-                event_type = getattr(event, "type", None)
+        ):
+            if isinstance(event, TextDelta):
+                if event.text:
+                    accumulated_text.append(event.text)
+                    yield AgentEvent("text_delta", {"text": event.text})
 
-                if event_type == "content_block_start":
-                    block = getattr(event, "content_block", None)
-                    block_type = getattr(block, "type", None)
-                    index = getattr(event, "index", None)
-                    if block_type == "tool_use":
-                        # Capture the (eventual) tool-use id + name
-                        # now; the input streams in across deltas.
-                        tool_use_blocks.append(
-                            {
-                                "type": "tool_use",
-                                "index": index,
-                                "id": getattr(block, "id", None),
-                                "name": getattr(block, "name", None),
-                                "input": {},
-                            }
-                        )
-                        partial_tool_inputs[index] = ""
+            elif isinstance(event, ToolUseStart):
+                tool_uses[event.index] = {
+                    "id": event.id,
+                    "name": event.name,
+                    "input": {},
+                }
+                partial_inputs.setdefault(event.index, "")
 
-                elif event_type == "content_block_delta":
-                    delta = getattr(event, "delta", None)
-                    delta_type = getattr(delta, "type", None)
-                    index = getattr(event, "index", None)
-                    if delta_type == "text_delta":
-                        text = getattr(delta, "text", "")
-                        accumulated_text_by_block_index[index] = (
-                            accumulated_text_by_block_index.get(index, "") + text
-                        )
-                        yield AgentEvent("text_delta", {"text": text})
-                    elif delta_type == "input_json_delta":
-                        partial_tool_inputs[index] = (
-                            partial_tool_inputs.get(index, "")
-                            + getattr(delta, "partial_json", "")
-                        )
+            elif isinstance(event, ToolInputDelta):
+                partial_inputs[event.index] = (
+                    partial_inputs.get(event.index, "") + event.partial_json
+                )
 
-                elif event_type == "content_block_stop":
-                    index = getattr(event, "index", None)
-                    if index in partial_tool_inputs:
-                        # Finalize the tool-use block's input.
-                        for tu in tool_use_blocks:
-                            if tu["index"] == index:
-                                tu["input"] = _safe_json(partial_tool_inputs[index])
+            elif isinstance(event, ToolUseStop):
+                if event.index in tool_uses:
+                    tool_uses[event.index]["input"] = _safe_json(
+                        partial_inputs.get(event.index, "")
+                    )
 
-                elif event_type == "message_delta":
-                    delta = getattr(event, "delta", None)
-                    sr = getattr(delta, "stop_reason", None)
-                    if sr is not None:
-                        stop_reason = sr
+            elif isinstance(event, MessageStop):
+                stop_reason = event.stop_reason
 
         # Reconstruct the assistant message in MCP-friendly form.
-        for index, text in accumulated_text_by_block_index.items():
-            if text:
-                assistant_blocks.append({"type": "text", "text": text})
-        for tu in tool_use_blocks:
+        assistant_blocks: list[dict[str, Any]] = []
+        joined_text = "".join(accumulated_text)
+        if joined_text:
+            assistant_blocks.append({"type": "text", "text": joined_text})
+        ordered_tool_uses = [tool_uses[i] for i in sorted(tool_uses)]
+        for tu in ordered_tool_uses:
+            # Backfill input for adapters that emitted ToolInputDelta
+            # but no ToolUseStop (defensive — current adapters all
+            # emit Stop, but it's cheap insurance).
+            if not tu["input"]:
+                index = next(
+                    (idx for idx, blk in tool_uses.items() if blk is tu), None
+                )
+                if index is not None:
+                    tu["input"] = _safe_json(partial_inputs.get(index, ""))
             assistant_blocks.append(
                 {
                     "type": "tool_use",
@@ -155,13 +159,13 @@ async def run_agent(
             )
         history.append({"role": "assistant", "content": assistant_blocks})
 
-        if stop_reason != "tool_use" or not tool_use_blocks:
+        if stop_reason != "tool_use" or not ordered_tool_uses:
             yield AgentEvent("turn_complete", {"stop_reason": stop_reason or "end_turn"})
             return
 
         # Dispatch each tool call and append the tool_result.
         tool_result_content: list[dict[str, Any]] = []
-        for tu in tool_use_blocks:
+        for tu in ordered_tool_uses:
             tool_name = tu["name"]
             tool_input = tu["input"]
             tu_id = tu["id"]

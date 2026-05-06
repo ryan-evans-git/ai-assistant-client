@@ -1,16 +1,13 @@
-"""Agent loop tests with a stubbed Anthropic client.
+"""Agent loop tests with a stubbed LLMProvider.
 
-We don't hit the real API.  The stub mimics the streaming
-``messages.stream`` shape closely enough for the agent loop to
-detect tool-use, dispatch to the registry / dispatcher, and
-re-enter Claude with the tool_result.
+The provider stub yields normalized events directly, so these tests
+exercise the agent loop without touching any vendor SDK.  Provider
+adapters (Anthropic / OpenAI / Gemini / Bedrock) are tested
+separately for their translation logic.
 """
 
 from __future__ import annotations
 
-import json
-from contextlib import asynccontextmanager
-from dataclasses import dataclass
 from typing import Any, AsyncIterator
 
 import pytest
@@ -20,111 +17,69 @@ from ai_assistant_client.discovery import (
     ProgressiveToolRegistry,
     RemoteToolDescriptor,
 )
+from ai_assistant_client.llm import (
+    LLMProvider,
+    MessageStop,
+    NormalizedEvent,
+    TextDelta,
+    ToolInputDelta,
+    ToolUseStart,
+    ToolUseStop,
+)
 
 
 # ---------------------------------------------------------------------------
-# Stub Anthropic client.
+# Stub provider.
 # ---------------------------------------------------------------------------
 
 
-@dataclass
-class _StreamEvent:
-    type: str
-    index: int | None = None
-    content_block: Any | None = None
-    delta: Any | None = None
+class _StubProvider(LLMProvider):
+    """Replays a scripted sequence of normalized event lists, one per
+    ``stream_turn`` call."""
 
-
-@dataclass
-class _ContentBlock:
-    type: str
-    id: str | None = None
-    name: str | None = None
-
-
-@dataclass
-class _Delta:
-    type: str
-    text: str = ""
-    partial_json: str = ""
-    stop_reason: str | None = None
-
-
-class _StubStream:
-    def __init__(self, events: list[_StreamEvent]) -> None:
-        self._events = events
-
-    async def __aenter__(self) -> "_StubStream":
-        return self
-
-    async def __aexit__(self, *exc: Any) -> None:
-        pass
-
-    def __aiter__(self) -> AsyncIterator[_StreamEvent]:
-        async def _gen() -> AsyncIterator[_StreamEvent]:
-            for ev in self._events:
-                yield ev
-
-        return _gen()
-
-
-class _StubMessages:
-    def __init__(self, scripted: list[list[_StreamEvent]]) -> None:
+    def __init__(self, scripted: list[list[NormalizedEvent]]) -> None:
         self._scripted = list(scripted)
         self.calls: list[dict[str, Any]] = []
 
-    def stream(self, **kwargs: Any) -> _StubStream:
-        self.calls.append(kwargs)
-        if not self._scripted:
-            return _StubStream([
-                _StreamEvent(type="message_delta", delta=_Delta(type="message_delta", stop_reason="end_turn"))
-            ])
-        events = self._scripted.pop(0)
-        return _StubStream(events)
+    async def stream_turn(
+        self,
+        *,
+        model: str,
+        max_tokens: int,
+        system: str,
+        tools: list[dict[str, Any]],
+        messages: list[dict[str, Any]],
+    ) -> AsyncIterator[NormalizedEvent]:
+        self.calls.append(
+            {
+                "model": model,
+                "max_tokens": max_tokens,
+                "system": system,
+                "tools": tools,
+                "messages": [m for m in messages],
+            }
+        )
+        events = (
+            self._scripted.pop(0)
+            if self._scripted
+            else [MessageStop(stop_reason="end_turn")]
+        )
+        for ev in events:
+            yield ev
 
 
-class _StubClient:
-    def __init__(self, scripted: list[list[_StreamEvent]]) -> None:
-        self.messages = _StubMessages(scripted)
-
-
-def _text_only_turn(text: str) -> list[_StreamEvent]:
-    return [
-        _StreamEvent(
-            type="content_block_start",
-            index=0,
-            content_block=_ContentBlock(type="text"),
-        ),
-        _StreamEvent(
-            type="content_block_delta",
-            index=0,
-            delta=_Delta(type="text_delta", text=text),
-        ),
-        _StreamEvent(type="content_block_stop", index=0),
-        _StreamEvent(type="message_delta", delta=_Delta(type="message_delta", stop_reason="end_turn")),
-    ]
+def _text_only_turn(text: str) -> list[NormalizedEvent]:
+    return [TextDelta(text=text), MessageStop(stop_reason="end_turn")]
 
 
 def _tool_use_turn(
-    *,
-    tool_id: str,
-    tool_name: str,
-    tool_input: dict[str, Any],
-) -> list[_StreamEvent]:
-    payload = json.dumps(tool_input)
+    *, tool_id: str, tool_name: str, tool_input_json: str
+) -> list[NormalizedEvent]:
     return [
-        _StreamEvent(
-            type="content_block_start",
-            index=0,
-            content_block=_ContentBlock(type="tool_use", id=tool_id, name=tool_name),
-        ),
-        _StreamEvent(
-            type="content_block_delta",
-            index=0,
-            delta=_Delta(type="input_json_delta", partial_json=payload),
-        ),
-        _StreamEvent(type="content_block_stop", index=0),
-        _StreamEvent(type="message_delta", delta=_Delta(type="message_delta", stop_reason="tool_use")),
+        ToolUseStart(index=0, id=tool_id, name=tool_name),
+        ToolInputDelta(index=0, partial_json=tool_input_json),
+        ToolUseStop(index=0),
+        MessageStop(stop_reason="tool_use"),
     ]
 
 
@@ -135,7 +90,7 @@ def _tool_use_turn(
 
 @pytest.mark.asyncio
 async def test_text_only_turn_completes_in_one_iteration() -> None:
-    client = _StubClient([_text_only_turn("hello world")])
+    provider = _StubProvider([_text_only_turn("hello world")])
     registry = ProgressiveToolRegistry([])
     history: list[dict[str, Any]] = []
 
@@ -148,7 +103,7 @@ async def test_text_only_turn_completes_in_one_iteration() -> None:
         history=history,
         registry=registry,
         dispatcher=dispatcher,
-        anthropic_client=client,
+        provider=provider,
         config=AgentRunConfig(),
     ):
         events.append(event)
@@ -157,7 +112,6 @@ async def test_text_only_turn_completes_in_one_iteration() -> None:
     assert "".join(e.data["text"] for e in text_events) == "hello world"
     assert events[-1].type == "turn_complete"
     assert events[-1].data["stop_reason"] == "end_turn"
-    # History: user msg + assistant msg.
     assert len(history) == 2
     assert history[0]["role"] == "user"
     assert history[1]["role"] == "assistant"
@@ -174,14 +128,16 @@ async def test_meta_tool_search_handled_inline() -> None:
     ]
     registry = ProgressiveToolRegistry(catalog)
 
-    client = _StubClient([
-        _tool_use_turn(
-            tool_id="tu_1",
-            tool_name="tool_search",
-            tool_input={"query": "pet"},
-        ),
-        _text_only_turn("done"),
-    ])
+    provider = _StubProvider(
+        [
+            _tool_use_turn(
+                tool_id="tu_1",
+                tool_name="tool_search",
+                tool_input_json='{"query": "pet"}',
+            ),
+            _text_only_turn("done"),
+        ]
+    )
 
     async def dispatcher(name: str, arguments: dict[str, Any]) -> Any:
         raise AssertionError("Meta tools should not reach dispatcher")
@@ -192,7 +148,7 @@ async def test_meta_tool_search_handled_inline() -> None:
         history=[],
         registry=registry,
         dispatcher=dispatcher,
-        anthropic_client=client,
+        provider=provider,
         config=AgentRunConfig(),
     ):
         events.append(event)
@@ -217,19 +173,21 @@ async def test_meta_tool_load_then_invoke() -> None:
     ]
     registry = ProgressiveToolRegistry(catalog)
 
-    client = _StubClient([
-        _tool_use_turn(
-            tool_id="tu_load",
-            tool_name="tool_load",
-            tool_input={"names": ["get_pet"]},
-        ),
-        _tool_use_turn(
-            tool_id="tu_call",
-            tool_name="get_pet",
-            tool_input={"id": 42},
-        ),
-        _text_only_turn("Got pet 42."),
-    ])
+    provider = _StubProvider(
+        [
+            _tool_use_turn(
+                tool_id="tu_load",
+                tool_name="tool_load",
+                tool_input_json='{"names": ["get_pet"]}',
+            ),
+            _tool_use_turn(
+                tool_id="tu_call",
+                tool_name="get_pet",
+                tool_input_json='{"id": 42}',
+            ),
+            _text_only_turn("Got pet 42."),
+        ]
+    )
 
     dispatcher_calls: list[tuple[str, dict[str, Any]]] = []
 
@@ -243,12 +201,11 @@ async def test_meta_tool_load_then_invoke() -> None:
         history=[],
         registry=registry,
         dispatcher=dispatcher,
-        anthropic_client=client,
+        provider=provider,
         config=AgentRunConfig(),
     ):
         events.append(event)
 
-    # tool_load should NOT have hit the dispatcher.  get_pet should.
     assert dispatcher_calls == [("get_pet", {"id": 42})]
     assert "get_pet" in registry.loaded_tools
 
@@ -265,14 +222,14 @@ async def test_dispatcher_error_surfaces_as_tool_result_error() -> None:
     registry = ProgressiveToolRegistry(catalog)
     registry.handle_meta_call("tool_load", {"names": ["broken_tool"]})
 
-    client = _StubClient([
-        _tool_use_turn(
-            tool_id="tu_x",
-            tool_name="broken_tool",
-            tool_input={},
-        ),
-        _text_only_turn("ok"),
-    ])
+    provider = _StubProvider(
+        [
+            _tool_use_turn(
+                tool_id="tu_x", tool_name="broken_tool", tool_input_json="{}"
+            ),
+            _text_only_turn("ok"),
+        ]
+    )
 
     async def dispatcher(name: str, arguments: dict[str, Any]) -> Any:
         raise RuntimeError("upstream is down")
@@ -283,7 +240,7 @@ async def test_dispatcher_error_surfaces_as_tool_result_error() -> None:
         history=[],
         registry=registry,
         dispatcher=dispatcher,
-        anthropic_client=client,
+        provider=provider,
         config=AgentRunConfig(),
     ):
         events.append(event)
@@ -307,12 +264,13 @@ async def test_max_iterations_caps_loop() -> None:
     )
     registry.handle_meta_call("tool_load", {"names": ["loop_tool"]})
 
-    # Always emit tool_use.
     scripted = [
-        _tool_use_turn(tool_id=f"tu_{i}", tool_name="loop_tool", tool_input={})
+        _tool_use_turn(
+            tool_id=f"tu_{i}", tool_name="loop_tool", tool_input_json="{}"
+        )
         for i in range(20)
     ]
-    client = _StubClient(scripted)
+    provider = _StubProvider(scripted)
 
     async def dispatcher(name: str, arguments: dict[str, Any]) -> Any:
         return "round trip"
@@ -323,7 +281,7 @@ async def test_max_iterations_caps_loop() -> None:
         history=[],
         registry=registry,
         dispatcher=dispatcher,
-        anthropic_client=client,
+        provider=provider,
         config=AgentRunConfig(max_tool_iterations=3),
     ):
         events.append(event)

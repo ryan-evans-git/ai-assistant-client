@@ -1,8 +1,12 @@
 # ai-assistant-client
 
-A streaming chat client for Claude with first-class MCP tool support and
-**progressive tool discovery** — the model searches the catalog and loads
-schemas on demand instead of receiving every tool's schema on every turn.
+A provider-agnostic streaming chat client with first-class MCP tool
+support and **progressive tool discovery** — the model searches the
+catalog and loads schemas on demand instead of receiving every tool's
+schema on every turn.
+
+Pick your LLM with a single env var: **Anthropic Claude**, **OpenAI**,
+**Google Gemini**, or **AWS Bedrock (Converse)**.
 
 ```
 client/v1
@@ -28,18 +32,90 @@ schemas scales with what the model actually needs, not with catalog size.
 Loaded schemas persist for the session — once `tool_load`ed, a tool can
 be called directly on subsequent turns.
 
+## Pluggable LLM providers
+
+Set `LLM_PROVIDER` to pick the backend; the matching SDK is the only
+one that needs to be installed.
+
+| `LLM_PROVIDER` | Default model              | Credential env                     | Install extra |
+|----------------|----------------------------|------------------------------------|---------------|
+| `anthropic`    | `claude-sonnet-4-6`        | `ANTHROPIC_API_KEY`                | `[anthropic]` |
+| `openai`       | `gpt-4o`                   | `OPENAI_API_KEY`                   | `[openai]`    |
+| `gemini`       | `gemini-2.0-flash`         | `GEMINI_API_KEY` / `GOOGLE_API_KEY`| `[gemini]`    |
+| `bedrock`      | `anthropic.claude-3-5-sonnet-20241022-v2:0` | standard AWS credential chain | `[bedrock]` |
+
+Override the model with `LLM_MODEL`. The progressive-tool-discovery
+behavior, SSE event shape, and MCP integration are identical across
+providers — translation lives entirely in the per-provider adapters
+under `ai_assistant_client/llm/`.
+
+## Why a custom provider abstraction (and not LiteLLM/aisuite)
+
+A "universal LLM SDK" is the obvious shortcut. We didn't take it for
+two reasons:
+
+**1. Tool-call semantics are the part you don't want a third party
+deciding for you.** With MCP, tool input schemas are user-authored
+JSON Schema and round-trip back to remote servers as `tool_use_id` →
+`tool_result` pairs. Every provider expresses this differently
+(Anthropic blocks, OpenAI `tool_calls[]`, Gemini `function_call`
+parts, Bedrock Converse `toolUse` blocks), and universal wrappers
+normalize to whichever shape they were born from — usually OpenAI's,
+which loses fidelity (no per-result error flags, weaker streaming
+semantics for partial JSON, ad-hoc `id` correlation). Owning ~100
+lines of adapter per provider keeps the loop, the registry, and the
+SSE contract unchanged regardless of backend.
+
+**2. Supply-chain risk.** This service holds production LLM
+credentials and brokers tool calls into your MCP fleet — it's a
+high-value target. Pulling in a broad LLM-gateway dependency widens
+the attack surface considerably:
+
+- Every provider SDK is also a transitive dep, even ones you don't use.
+- The wrapper itself becomes a privileged credential consumer; a
+  compromised release can exfiltrate `ANTHROPIC_API_KEY`,
+  `OPENAI_API_KEY`, AWS keys, and request bodies in one shot.
+- Some popular LLM-gateway packages ship telemetry, hosted-proxy, or
+  auto-update features that quietly route requests through
+  third-party infrastructure unless explicitly disabled.
+- The wider Python AI tooling ecosystem has seen multiple recent
+  supply-chain incidents (typo-squatted packages, credential-stealing
+  releases, and a high-profile gateway maintainer key compromise) —
+  treat any package that touches model credentials as
+  security-critical.
+
+By depending only on the first-party SDK for the provider you've
+actually selected (lazy-imported, behind an extras marker), the
+service holds no third-party code on the credential path. Anthropic,
+OpenAI, Google, and AWS all have well-staffed security teams and
+signed releases; that is a defensible perimeter. A wrapper sitting in
+front of all four is not.
+
+If you want LiteLLM later, you can write a fifth adapter in ~100
+lines — but for the four major providers we ship, it isn't worth the
+risk.
+
 ## Install
 
 ```bash
-pip install git+https://github.com/ryan-evans-git/ai-assistant-client.git
+# Just the core + Anthropic.
+pip install "git+https://github.com/ryan-evans-git/ai-assistant-client.git#egg=ai-assistant-client[anthropic]"
+
+# Or any other single provider:
+pip install "git+...#egg=ai-assistant-client[openai]"
+pip install "git+...#egg=ai-assistant-client[gemini]"
+pip install "git+...#egg=ai-assistant-client[bedrock]"
+
+# Everything:
+pip install "git+...#egg=ai-assistant-client[all]"
 ```
 
-Or for local dev:
+Local dev:
 
 ```bash
 git clone https://github.com/ryan-evans-git/ai-assistant-client.git
 cd ai-assistant-client
-pip install -e ".[dev]"
+pip install -e ".[dev,all]"
 ```
 
 Python 3.11+ required.
@@ -47,7 +123,11 @@ Python 3.11+ required.
 ## Quickstart
 
 ```bash
+# Pick a provider (default: anthropic).
+export LLM_PROVIDER=anthropic
 export ANTHROPIC_API_KEY=sk-ant-...
+# Optional: pin a specific model.
+# export LLM_MODEL=claude-sonnet-4-6
 
 # Connect to one MCP server over stdio + one over SSE.
 export MCP_SERVERS='[
@@ -63,6 +143,7 @@ Or via Docker:
 ```bash
 docker build -t ai-assistant-client .
 docker run -p 8080:8080 \
+  -e LLM_PROVIDER -e LLM_MODEL \
   -e ANTHROPIC_API_KEY \
   -e MCP_SERVERS \
   ai-assistant-client
@@ -95,7 +176,12 @@ the prior turns back in the next `POST /chat` body.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `ANTHROPIC_API_KEY` | _(required)_ | Claude credential. |
+| `LLM_PROVIDER` | `anthropic` | One of `anthropic`, `openai`, `gemini`, `bedrock`. |
+| `LLM_MODEL` | provider default | Override the model name passed to the provider. |
+| `ANTHROPIC_API_KEY` | — | Required when `LLM_PROVIDER=anthropic`. |
+| `OPENAI_API_KEY` | — | Required when `LLM_PROVIDER=openai`. |
+| `GEMINI_API_KEY` / `GOOGLE_API_KEY` | — | Required when `LLM_PROVIDER=gemini`. |
+| `AWS_*` (standard chain) | — | Used when `LLM_PROVIDER=bedrock`. |
 | `MCP_SERVERS` | _(optional)_ | JSON array of upstream MCP servers. |
 | `AI_ASSISTANT_CLIENT_HOST` | `127.0.0.1` | Bind host. |
 | `AI_ASSISTANT_CLIENT_PORT` | `8080` | Bind port. |
@@ -122,10 +208,10 @@ authenticated end-user.
 
 ```python
 import asyncio
-from anthropic import AsyncAnthropic
 from ai_assistant_client import McpPool, McpServerConfig, ProgressiveToolRegistry
 from ai_assistant_client.discovery import RemoteToolDescriptor
 from ai_assistant_client.agent import AgentRunConfig, run_agent
+from ai_assistant_client.llm import default_model, make_provider
 
 
 async def main() -> None:
@@ -137,15 +223,15 @@ async def main() -> None:
         registry = ProgressiveToolRegistry(
             [RemoteToolDescriptor(name=t.name, description=t.description, input_schema=t.input_schema) for t in tools]
         )
-        client = AsyncAnthropic()
+        provider = make_provider("anthropic")  # or "openai" / "gemini" / "bedrock"
         history: list[dict] = []
         async for event in run_agent(
             user_message="What pet operations are available?",
             history=history,
             registry=registry,
             dispatcher=pool.call_tool,
-            anthropic_client=client,
-            config=AgentRunConfig(),
+            provider=provider,
+            config=AgentRunConfig(model=default_model("anthropic")),
         ):
             print(event.type, event.data)
 
@@ -157,12 +243,19 @@ asyncio.run(main())
 
 ```
 ai_assistant_client/
-  app.py             # Starlette + SSE service
-  agent.py           # Streaming Claude loop with tool dispatch
-  discovery.py       # ProgressiveToolRegistry + meta-tools
-  mcp_pool.py        # Live sessions to N upstream MCP servers
+  app.py                 # Starlette + SSE service
+  agent.py               # Streaming agent loop with tool dispatch
+  discovery.py           # ProgressiveToolRegistry + meta-tools
+  mcp_pool.py            # Live sessions to N upstream MCP servers
+  llm/
+    base.py              # LLMProvider ABC + normalized event types
+    anthropic_provider.py
+    openai_provider.py
+    gemini_provider.py
+    bedrock_provider.py  # Bedrock Converse API
+    __init__.py          # make_provider() factory + default_model()
 
-tests/               # pytest, no real Anthropic / MCP traffic
+tests/                   # pytest, no real LLM / MCP traffic
 ```
 
 ## Companion projects

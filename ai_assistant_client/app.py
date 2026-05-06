@@ -12,7 +12,11 @@ Configure upstream MCP servers via ``MCP_SERVERS`` env (JSON):
       {"name":"local","command":"ai-assistant-server","args":["--tools-dir","./tools"]}
     ]'
 
-Anthropic credentials come from the standard ``ANTHROPIC_API_KEY``.
+Pick the LLM with ``LLM_PROVIDER`` (``anthropic`` | ``openai`` |
+``gemini`` | ``bedrock``; default ``anthropic``) and override the
+model with ``LLM_MODEL``.  Each provider reads its own credentials
+from the SDK's standard env (``ANTHROPIC_API_KEY``, ``OPENAI_API_KEY``,
+``GEMINI_API_KEY`` / ``GOOGLE_API_KEY``, or the standard AWS chain).
 """
 
 from __future__ import annotations
@@ -39,6 +43,7 @@ from ai_assistant_client.discovery import (
     ProgressiveToolRegistry,
     RemoteToolDescriptor,
 )
+from ai_assistant_client.llm import LLMProvider, default_model, make_provider
 from ai_assistant_client.mcp_pool import McpPool, McpServerConfig
 
 
@@ -49,7 +54,7 @@ log = logging.getLogger(__name__)
 _state: dict[str, Any] = {
     "pool": None,
     "registry": None,
-    "anthropic_client": None,
+    "provider": None,
     "config": None,
 }
 
@@ -100,8 +105,16 @@ async def lifespan(app: Starlette) -> AsyncIterator[None]:
         _state["pool"] = None
         _state["registry"] = ProgressiveToolRegistry([])
 
-    _state["config"] = AgentRunConfig()
-    _state["anthropic_client"] = _anthropic_client()
+    provider_name = os.environ.get("LLM_PROVIDER", "anthropic")
+    model = os.environ.get("LLM_MODEL") or default_model(provider_name)
+    if not model:
+        raise RuntimeError(
+            f"No default model for LLM_PROVIDER={provider_name!r}; "
+            "set LLM_MODEL explicitly."
+        )
+    log.info("Using LLM provider=%s model=%s", provider_name, model)
+    _state["config"] = AgentRunConfig(model=model)
+    _state["provider"] = make_provider(provider_name)
     try:
         yield
     finally:
@@ -110,17 +123,7 @@ async def lifespan(app: Starlette) -> AsyncIterator[None]:
             await pool.__aexit__(None, None, None)
         _state["pool"] = None
         _state["registry"] = None
-        _state["anthropic_client"] = None
-
-
-def _anthropic_client() -> Any:
-    try:
-        from anthropic import AsyncAnthropic
-    except ImportError as err:
-        raise RuntimeError(
-            "Install the 'anthropic' package: pip install anthropic"
-        ) from err
-    return AsyncAnthropic()
+        _state["provider"] = None
 
 
 # ---------------------------------------------------------------------------
@@ -161,7 +164,7 @@ async def chat(request: Request) -> Response:
     registry: ProgressiveToolRegistry = _state["registry"]
     pool: McpPool | None = _state.get("pool")
     config: AgentRunConfig = _state["config"]
-    client = _state["anthropic_client"]
+    provider: LLMProvider = _state["provider"]
 
     async def dispatcher(name: str, arguments: dict[str, Any]) -> Any:
         if pool is None:
@@ -175,7 +178,7 @@ async def chat(request: Request) -> Response:
                 history=history,
                 registry=registry,
                 dispatcher=dispatcher,
-                anthropic_client=client,
+                provider=provider,
                 config=config,
             ):
                 yield event.to_sse()

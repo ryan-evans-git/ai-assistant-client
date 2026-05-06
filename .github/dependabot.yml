@@ -1,0 +1,44 @@
+version: 2
+
+# Dependabot opens PRs for outdated deps + flagged vulnerabilities.
+# Weekly cadence keeps PR noise tolerable; security updates are
+# always opened immediately regardless of schedule.
+
+updates:
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 5
+    groups:
+      # Bundle minor + patch bumps into one PR per ecosystem to
+      # avoid 12 separate PRs every Monday. Major bumps still get
+      # their own PR (default behavior).
+      python-minor-and-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 5
+    groups:
+      actions-minor-and-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 3
