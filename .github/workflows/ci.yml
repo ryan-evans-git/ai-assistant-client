@@ -61,8 +61,8 @@ jobs:
         # an editable local install on PyPI).
         run: pip-audit --skip-editable
 
-      - name: pytest
-        run: pytest -q
+      - name: pytest (with branch coverage gate ≥90%)
+        run: pytest -q --cov=ai_assistant_client --cov-branch --cov-report=term-missing --cov-fail-under=90
 
   trivy:
     name: trivy (filesystem + Dockerfile)
