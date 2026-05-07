@@ -17,7 +17,6 @@ import pytest
 from ai_assistant_client.mcp_pool import (
     McpPool,
     McpServerConfig,
-    RemoteTool,
     _result_to_text,
     list_tools_once,
 )
@@ -86,7 +85,7 @@ def _make_fake_session(tool_names: list[str]) -> MagicMock:
     )
     session.call_tool = AsyncMock(
         return_value=SimpleNamespace(
-            content=[SimpleNamespace(type="text", text=f"called")],
+            content=[SimpleNamespace(type="text", text="called")],
             isError=False,
         )
     )

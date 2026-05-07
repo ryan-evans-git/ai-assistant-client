@@ -6,7 +6,6 @@ import json
 import sys
 from types import ModuleType, SimpleNamespace
 from typing import Any
-from unittest.mock import patch
 
 import pytest
 

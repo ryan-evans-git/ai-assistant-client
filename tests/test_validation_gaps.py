@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from typing import Any
 
 import pytest
@@ -13,7 +12,6 @@ from ai_assistant_client.validation.auditor import (
     _parse_auditor_output,
     run_auditor,
 )
-from ai_assistant_client.validation.types import ValidationIssue
 
 
 # ---------------------------------------------------------------------------
