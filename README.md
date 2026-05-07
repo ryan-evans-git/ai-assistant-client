@@ -166,6 +166,7 @@ Event stream (each is a JSON `data:` payload):
 | `tool_use` | `{ "id", "name", "input" }` |
 | `tool_result` | `{ "id", "content" }` |
 | `tool_error` | `{ "id", "name", "error" }` |
+| `visual` | `{ "tool_use_id", "schema_version", "spec" }` (when the model calls `render_visual`; see [`VISUAL_SPEC.md`](VISUAL_SPEC.md)) |
 | `validation` | `{ "method", "passed", "citations_total", "citations_verified", "issues", "auditor_used", "auditor_model" }` (only when `validation_mode != "off"`) |
 | `validation_retry` | `{ "retries_remaining", "feedback_preview" }` (when an auto-retry fires) |
 | `turn_complete` | `{ "stop_reason", ... }` |
@@ -199,6 +200,50 @@ rejects `cachePoint` blocks. The history shape passed to the provider
 adapter is *not* mutated — caching markers are inserted into a
 shallow-copied request and the caller's `history` list keeps its
 provider-neutral form for use across turns and adapters.
+
+## Visuals (charts, tables, KPI tiles, images)
+
+The model can render structured visuals in the host UI by calling the
+built-in `render_visual(schema_version, spec)` meta-tool — alongside
+`tool_search` / `tool_load`, no setup required.
+
+```python
+# What the model emits (one tool_use, dispatched by the agent loop):
+render_visual(
+  schema_version=1,
+  spec={
+    "kind": "chart",
+    "chart_type": "bar",
+    "title": "Open invoices by aging bucket",
+    "data": [
+      {"bucket": "0-30",  "count": 12},
+      {"bucket": "31-60", "count":  3},
+      {"bucket": "60+",   "count":  1}
+    ],
+    "x_key": "bucket",
+    "y_keys": ["count"]
+  }
+)
+```
+
+The agent loop validates the spec (Pydantic), emits an
+`AgentEvent("visual", {tool_use_id, schema_version, spec})` for the
+host UI to render, and returns a one-line confirmation as the
+`tool_result` so the model can compose a follow-up text takeaway.
+Malformed specs come back as a friendly error in the tool_result —
+the model can correct on the next turn.
+
+**Supported visual kinds (v1):** `chart` (bar / line / area / pie /
+donut / scatter), `table`, `kpi` (single-stat with optional trend),
+`image`. Full wire schema lives in
+[`VISUAL_SPEC.md`](VISUAL_SPEC.md) and is duplicated identically in
+`ai-assistant-ui`.
+
+**Image source safety.** Images are restricted to `https://` URLs and
+non-SVG `data:image/...` URIs (for previewing host-side uploads).
+SVG is rejected (script-carrying surface). Data URIs are size-capped
+via `AgentRunConfig.max_image_data_uri_kb` (default 5 MB of decoded
+payload).
 
 ## Hybrid response validation
 

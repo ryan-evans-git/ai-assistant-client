@@ -39,6 +39,11 @@ log = logging.getLogger(__name__)
 
 _META_TOOL_SEARCH_NAME = "tool_search"
 _META_TOOL_LOAD_NAME = "tool_load"
+_RENDER_VISUAL_TOOL_NAME = "render_visual"
+
+# Re-exported for the agent loop's dispatch — kept as a constant so
+# the wire name lives in exactly one place.
+RENDER_VISUAL_TOOL_NAME = _RENDER_VISUAL_TOOL_NAME
 
 
 @dataclass(frozen=True)
@@ -86,19 +91,36 @@ class ProgressiveToolRegistry:
         self._loaded.clear()
 
     def is_meta_tool(self, name: str) -> bool:
+        # Tools the registry handles inline (no remote dispatch).
         return name in (_META_TOOL_SEARCH_NAME, _META_TOOL_LOAD_NAME)
 
+    def is_visual_tool(self, name: str) -> bool:
+        """Visuals are *registry-known* (we surface their schema and
+        recognize their name) but *agent-handled* — the validation
+        and side-effect (emitting an ``AgentEvent("visual", ...)``)
+        live in the agent loop, not here."""
+        return name == _RENDER_VISUAL_TOOL_NAME
+
     def is_known_tool(self, name: str) -> bool:
-        return name in self._catalog or self.is_meta_tool(name)
+        return (
+            name in self._catalog
+            or self.is_meta_tool(name)
+            or self.is_visual_tool(name)
+        )
 
     def anthropic_tools(self) -> list[dict[str, Any]]:
         """Tools to include in the next ``messages.create`` call.
 
-        Always includes the two meta-tools.  Includes the full
-        schema of every tool the model has explicitly loaded
+        Always includes the meta-tools (``tool_search``, ``tool_load``)
+        plus the visual rendering tool (``render_visual``).  Includes
+        the full schema of every tool the model has explicitly loaded
         this session.
         """
-        tools: list[dict[str, Any]] = [self._tool_search_schema(), self._tool_load_schema()]
+        tools: list[dict[str, Any]] = [
+            self._tool_search_schema(),
+            self._tool_load_schema(),
+            self._render_visual_schema(),
+        ]
         for name in sorted(self._loaded):
             descriptor = self._catalog.get(name)
             if descriptor is None:
@@ -250,6 +272,49 @@ class ProgressiveToolRegistry:
             },
         }
 
+    def _render_visual_schema(self) -> dict[str, Any]:
+        # The wire spec lives in VISUAL_SPEC.md and the Pydantic
+        # models in ai_assistant_client/visuals/types.py — this
+        # JSON-Schema mirror is what the LLM sees.  Kept loose
+        # (additionalProperties true on per-kind shapes) so future
+        # spec versions can extend without forcing a bump until the
+        # agent loop's validator actually catches up.
+        return {
+            "name": _RENDER_VISUAL_TOOL_NAME,
+            "description": (
+                "Render a chart, table, KPI tile, or image in the "
+                "host UI.  Use this when you have data or a result "
+                "the user would understand more clearly as a visual.  "
+                "The host renders the spec; you receive a short "
+                "confirmation in the tool_result.\n\n"
+                "Always pair the visual with a short text summary in "
+                "the same response — the user may be on a screen "
+                "reader or copying the answer to a non-visual surface.\n\n"
+                "Supported kinds: chart (bar/line/area/pie/donut/scatter), "
+                "table, kpi (single big-number stat), image."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "schema_version": {
+                        "type": "integer",
+                        "description": "Pin to 1 for the current spec.",
+                        "const": 1,
+                    },
+                    "spec": {
+                        "oneOf": [
+                            _CHART_INPUT_SCHEMA,
+                            _TABLE_INPUT_SCHEMA,
+                            _KPI_INPUT_SCHEMA,
+                            _IMAGE_INPUT_SCHEMA,
+                        ],
+                    },
+                },
+                "required": ["schema_version", "spec"],
+                "additionalProperties": False,
+            },
+        }
+
 
 # ---------------------------------------------------------------------------
 # Fuzzy ranking
@@ -285,3 +350,114 @@ def _first_line(text: str) -> str:
         if line:
             return line[:200]
     return ""
+
+
+# ---------------------------------------------------------------------------
+# render_visual: per-kind JSON-Schema fragments shown to the LLM
+# ---------------------------------------------------------------------------
+
+# These mirror the Pydantic models in visuals/types.py — kept here so
+# the LLM sees the schema even when the visuals module isn't imported.
+# A drift-checker test could codegen these from Pydantic on demand;
+# for now, change both together when the spec evolves.
+
+_CHART_INPUT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "title": "ChartSpec",
+    "properties": {
+        "kind": {"const": "chart"},
+        "chart_type": {
+            "enum": ["bar", "line", "area", "pie", "donut", "scatter"]
+        },
+        "title": {"type": "string"},
+        "data": {
+            "type": "array",
+            "items": {"type": "object"},
+            "description": (
+                "Cartesian (bar/line/area/scatter): rows keyed by "
+                "x_key + y_keys.  Pie/donut: rows must have label "
+                "(string) and value (number)."
+            ),
+        },
+        "x_key": {"type": "string"},
+        "y_keys": {"type": "array", "items": {"type": "string"}},
+        "x_label": {"type": "string"},
+        "y_label": {"type": "string"},
+        "stacked": {"type": "boolean"},
+    },
+    "required": ["kind", "chart_type", "data"],
+    "additionalProperties": False,
+}
+
+_TABLE_INPUT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "title": "TableSpec",
+    "properties": {
+        "kind": {"const": "table"},
+        "title": {"type": "string"},
+        "columns": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "key": {"type": "string"},
+                    "label": {"type": "string"},
+                    "type": {
+                        "enum": ["string", "number", "currency", "date", "boolean"]
+                    },
+                    "align": {"enum": ["left", "center", "right"]},
+                },
+                "required": ["key", "label"],
+                "additionalProperties": False,
+            },
+        },
+        "rows": {"type": "array", "items": {"type": "object"}},
+    },
+    "required": ["kind", "columns", "rows"],
+    "additionalProperties": False,
+}
+
+_KPI_INPUT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "title": "KpiSpec",
+    "properties": {
+        "kind": {"const": "kpi"},
+        "label": {"type": "string"},
+        "value": {"type": ["string", "number"]},
+        "unit": {"type": "string"},
+        "trend": {
+            "type": "object",
+            "properties": {
+                "direction": {"enum": ["up", "down", "flat"]},
+                "delta": {"type": ["string", "number"]},
+                "period": {"type": "string"},
+            },
+            "required": ["direction", "delta"],
+            "additionalProperties": False,
+        },
+        "status": {"enum": ["good", "warn", "bad", "neutral"]},
+    },
+    "required": ["kind", "label", "value"],
+    "additionalProperties": False,
+}
+
+_IMAGE_INPUT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "title": "ImageSpec",
+    "properties": {
+        "kind": {"const": "image"},
+        "src": {
+            "type": "string",
+            "description": (
+                "https:// URL or data:image/(png|jpeg|jpg|gif|webp)"
+                ";base64,... URI.  SVG is not allowed."
+            ),
+        },
+        "alt": {"type": "string"},
+        "width": {"type": "integer", "minimum": 1},
+        "height": {"type": "integer", "minimum": 1},
+        "caption": {"type": "string"},
+    },
+    "required": ["kind", "src", "alt"],
+    "additionalProperties": False,
+}

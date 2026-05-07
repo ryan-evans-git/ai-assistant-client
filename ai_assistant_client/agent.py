@@ -34,6 +34,12 @@ from ai_assistant_client.validation import (
     build_retry_feedback,
     run_validation,
 )
+from ai_assistant_client.visuals import (
+    DEFAULT_MAX_IMAGE_DATA_URI_KB,
+    InvalidVisualSpecError,
+    VisualEnvelope,
+    validate_envelope,
+)
 
 
 log = logging.getLogger(__name__)
@@ -93,6 +99,15 @@ class AgentRunConfig:
     # to revise (with the "OK to not know" reminder).  ``0`` = emit the
     # validation event but never retry.
     max_validation_retries: int = 2
+
+    # ---------------------------------------------------------------
+    # Visuals (render_visual meta-tool)
+    # ---------------------------------------------------------------
+    # Per-image cap on data: URIs the LLM is allowed to embed.  Bound
+    # exists to keep history payload + LLM context spend in check
+    # (5 MB default — typical Claude Sonnet limit is ~5 MB per image
+    # block too).
+    max_image_data_uri_kb: int = DEFAULT_MAX_IMAGE_DATA_URI_KB
 
 
 async def run_agent(
@@ -248,6 +263,31 @@ async def run_agent(
                 try:
                     if registry.is_meta_tool(tool_name):
                         result_text = registry.handle_meta_call(tool_name, tool_input)
+                    elif registry.is_visual_tool(tool_name):
+                        # Validate the spec; emit the visual event when
+                        # it passes; surface the InvalidVisualSpecError
+                        # message as the tool_result on failure so the
+                        # model can correct.
+                        try:
+                            envelope = validate_envelope(
+                                tool_input,
+                                max_image_data_uri_kb=config.max_image_data_uri_kb,
+                            )
+                        except InvalidVisualSpecError as ve:
+                            result_text = (
+                                f"render_visual rejected: {ve}. "
+                                "Fix the spec and try again, or fall back to text."
+                            )
+                        else:
+                            yield AgentEvent(
+                                "visual",
+                                {
+                                    "tool_use_id": tu_id,
+                                    "schema_version": envelope.schema_version,
+                                    "spec": envelope.spec.model_dump(),
+                                },
+                            )
+                            result_text = _summarize_visual(envelope)
                     elif registry.is_known_tool(tool_name):
                         result = await dispatcher(tool_name, tool_input)
                         result_text = result if isinstance(result, str) else _to_text(result)
@@ -356,3 +396,36 @@ def _to_text(value: Any) -> str:
         return json.dumps(value, default=str, indent=2)
     except (TypeError, ValueError):
         return str(value)
+
+
+def _summarize_visual(envelope: VisualEnvelope) -> str:
+    """Short, model-facing confirmation that a visual was rendered.
+
+    Intentionally compact — the LLM doesn't need to see the full spec
+    again (it just sent it).  The summary helps it craft a follow-up
+    text turn that complements the visual.
+    """
+    spec = envelope.spec
+    if spec.kind == "chart":
+        rows = len(spec.data)
+        series = ", ".join(spec.y_keys) if spec.y_keys else "label/value"
+        return (
+            f"Rendered: {spec.chart_type} chart with {rows} row(s); "
+            f"series: {series}.  Add a one-sentence text takeaway "
+            "below the visual."
+        )
+    if spec.kind == "table":
+        return (
+            f"Rendered: table with {len(spec.columns)} column(s) and "
+            f"{len(spec.rows)} row(s).  Add a one-sentence text "
+            "takeaway below the visual."
+        )
+    if spec.kind == "kpi":
+        return (
+            f"Rendered: KPI tile {spec.label!r} = {spec.value}"
+            + (f" {spec.unit}" if spec.unit else "")
+            + ".  Add brief context below."
+        )
+    if spec.kind == "image":
+        return f"Rendered: image ({spec.alt!r})."
+    return "Rendered."
