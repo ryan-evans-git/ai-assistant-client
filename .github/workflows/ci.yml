@@ -40,7 +40,7 @@ jobs:
           # be imported during collection. `[dev]` adds the test +
           # lint toolchain.
           pip install -e ".[dev,all]"
-          pip install bandit pip-audit
+          pip install bandit pip-audit pip-licenses
 
       - name: Ruff (lint)
         # Ruff is the source of truth for style + most static
@@ -60,6 +60,17 @@ jobs:
         # `ai-assistant-client` install (pip-audit can't look up
         # an editable local install on PyPI).
         run: pip-audit --skip-editable
+
+      - name: License check (block GPL/AGPL/SSPL/BUSL/Elastic)
+        # Substring match against each dep's license string.  Exact
+        # forms picked to avoid false-matching LGPL (which is
+        # weak-copyleft and acceptable for runtime/dynamic linking).
+        # MPL stays OK (file-level copyleft); add it here if policy
+        # tightens.  Runs with [dev,all] installed so it also covers
+        # every optional provider SDK (anthropic / openai / google-
+        # genai / boto3).
+        run: |
+          pip-licenses --fail-on="GPL-2.0;GPL-3.0;GPLv2;GPLv3;AGPL;Affero;SSPL;Server Side Public;BUSL;Business Source;Elastic License;Commons Clause"
 
       - name: pytest (with branch coverage gate ≥90%)
         run: pytest -q --cov=ai_assistant_client --cov-branch --cov-report=term-missing --cov-fail-under=90
