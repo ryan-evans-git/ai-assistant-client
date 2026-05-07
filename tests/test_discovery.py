@@ -34,7 +34,7 @@ def test_unloaded_catalog_tools_not_in_window() -> None:
     names = {t["name"] for t in registry.anthropic_tools()}
     # Catalog tools are NOT exposed until loaded.
     assert "get_pet" not in names
-    assert names == {"tool_search", "tool_load"}
+    assert names == {"tool_search", "tool_load", "render_visual"}
 
 
 def test_search_returns_top_matches() -> None:
