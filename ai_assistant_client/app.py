@@ -39,6 +39,11 @@ except ImportError:  # pragma: no cover
     EventSourceResponse = None  # type: ignore[assignment]
 
 from ai_assistant_client.agent import AgentRunConfig, run_agent
+from ai_assistant_client.confirmation_store import (
+    ConfirmationOutcome,
+    PendingConfirmationStore,
+    make_confirmation_store,
+)
 from ai_assistant_client.discovery import (
     ProgressiveToolRegistry,
     RemoteToolDescriptor,
@@ -56,6 +61,9 @@ _state: dict[str, Any] = {
     "registry": None,
     "provider": None,
     "config": None,
+    # Pending HITL confirmations.  Either an in-process map or a
+    # Redis-backed pubsub store, picked from ``REDIS_URL`` env.
+    "confirmations": None,
 }
 
 
@@ -91,6 +99,7 @@ async def lifespan(app: Starlette) -> AsyncIterator[None]:
                     name=t.name,
                     description=t.description,
                     input_schema=t.input_schema,
+                    hitl=getattr(t, "hitl", None),
                 )
                 for t in tools
             ]
@@ -104,6 +113,11 @@ async def lifespan(app: Starlette) -> AsyncIterator[None]:
         log.warning("No MCP_SERVERS configured — only the meta-tools will work")
         _state["pool"] = None
         _state["registry"] = ProgressiveToolRegistry([])
+
+    # Confirmation store: in-process by default, Redis-backed when
+    # REDIS_URL is set so multi-worker deployments can route a
+    # POST /chat/confirm to whichever worker owns the SSE stream.
+    _state["confirmations"] = make_confirmation_store()
 
     provider_name = os.environ.get("LLM_PROVIDER", "anthropic")
     model = os.environ.get("LLM_MODEL") or default_model(provider_name)
@@ -121,9 +135,13 @@ async def lifespan(app: Starlette) -> AsyncIterator[None]:
         pool = _state.get("pool")
         if pool is not None:
             await pool.__aexit__(None, None, None)
+        store: PendingConfirmationStore | None = _state.get("confirmations")
+        if store is not None:
+            await store.aclose()
         _state["pool"] = None
         _state["registry"] = None
         _state["provider"] = None
+        _state["confirmations"] = None
 
 
 # ---------------------------------------------------------------------------
@@ -165,11 +183,31 @@ async def chat(request: Request) -> Response:
     pool: McpPool | None = _state.get("pool")
     config: AgentRunConfig = _state["config"]
     provider: LLMProvider = _state["provider"]
+    store: PendingConfirmationStore | None = _state.get("confirmations")
 
     async def dispatcher(name: str, arguments: dict[str, Any]) -> Any:
         if pool is None:
             return f"Tool '{name}' is unavailable — no MCP servers configured."
         return await pool.call_tool(name, arguments)
+
+    # Track outstanding confirmation request_ids so a stream cancel
+    # can drop them from the store (otherwise their futures would
+    # leak until the next process restart).
+    outstanding: list[str] = []
+
+    async def confirmation_hook(payload: dict[str, Any]) -> ConfirmationOutcome:
+        if store is None:
+            # No store configured (lifespan never ran, e.g. unit
+            # test) — auto-confirm so the chat doesn't deadlock.
+            return ConfirmationOutcome(decision="confirm")
+        request_id = payload["request_id"]
+        outstanding.append(request_id)
+        fut = await store.register(request_id)
+        try:
+            return await fut
+        finally:
+            if request_id in outstanding:
+                outstanding.remove(request_id)
 
     async def event_iter() -> AsyncIterator[dict[str, str]]:
         try:
@@ -180,13 +218,57 @@ async def chat(request: Request) -> Response:
                 dispatcher=dispatcher,
                 provider=provider,
                 config=config,
+                confirmation_hook=confirmation_hook,
             ):
                 yield event.to_sse()
         except asyncio.CancelledError:
             yield {"event": "cancelled", "data": "{}"}
             raise
+        finally:
+            # Whether the stream finished cleanly or was cancelled,
+            # cancel any still-pending confirmations so their futures
+            # don't leak.
+            if store is not None:
+                for rid in outstanding:
+                    await store.cancel(rid)
 
     return EventSourceResponse(event_iter())
+
+
+async def chat_confirm(request: Request) -> Response:
+    """Resolve a pending HITL confirmation.
+
+    Body: ``{request_id, decision: "confirm"|"decline", note?}``.
+    Returns 200 on success, 404 if the id is unknown / already
+    resolved / expired, 400 on a malformed body.
+    """
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    request_id = (body.get("request_id") or "").strip()
+    decision = (body.get("decision") or "").strip()
+    note = body.get("note")
+    if not request_id or decision not in ("confirm", "decline"):
+        return JSONResponse(
+            {"error": "request_id and decision (confirm|decline) are required"},
+            status_code=400,
+        )
+    store: PendingConfirmationStore | None = _state.get("confirmations")
+    if store is None:
+        return JSONResponse(
+            {"error": "confirmation store not initialized"}, status_code=503
+        )
+    note_str = str(note) if note else None
+    delivered = await store.resolve(
+        request_id, ConfirmationOutcome(decision=decision, note=note_str)
+    )
+    if not delivered:
+        return JSONResponse(
+            {"error": f"unknown or expired request_id {request_id!r}"},
+            status_code=404,
+        )
+    return JSONResponse({"ok": True})
 
 
 def build_app() -> Starlette:
@@ -197,6 +279,7 @@ def build_app() -> Starlette:
             Route("/healthz", healthz, methods=["GET"]),
             Route("/tools", list_tools, methods=["GET"]),
             Route("/chat", chat, methods=["POST"]),
+            Route("/chat/confirm", chat_confirm, methods=["POST"]),
         ],
     )
 

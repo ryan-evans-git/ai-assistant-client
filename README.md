@@ -201,6 +201,42 @@ adapter is *not* mutated — caching markers are inserted into a
 shallow-copied request and the caller's `history` list keeps its
 provider-neutral form for use across turns and adapters.
 
+## Human-in-the-loop confirmations
+
+Tools the upstream MCP server marks `requires_confirmation=True`
+(see ai-assistant-server's `@tool(requires_confirmation=True, ...)`
+or `x-aai-requires-confirmation: true` OpenAPI extension) cause
+the agent loop to **pause** before dispatching them.
+
+Flow:
+
+1. Agent emits `tool_confirmation_request` over SSE — the payload
+   matches the `ToolConfirmationRequest` shape the React UI expects
+   (`request_id`, `tool_use_id`, `tool_name`, `tool_description`,
+   `tool_input`, optional `message`, `timeout_seconds`).
+2. UI shows the modal; user clicks Confirm or Decline (with an
+   optional note).
+3. Host sends `POST /chat/confirm` with `{request_id, decision, note?}`.
+4. Agent resumes — confirms run normally; declines append a
+   "User declined: …" tool_result so the LLM can adapt.
+5. Timeout (default 60s, override per-tool) is treated as decline.
+
+Single-worker deployments use an in-memory pending-confirmation
+store. Multi-worker deployments (uvicorn `--workers N`, anything
+behind a load balancer) need a pubsub channel so a `/chat/confirm`
+that lands on a worker other than the streaming one still reaches
+the awaiting future:
+
+```bash
+pip install ai-assistant-client[redis]
+export REDIS_URL=redis://localhost:6379
+uvicorn ai_assistant_client.app:app --workers 4
+```
+
+Tunables on `AgentRunConfig`:
+`confirmation_default_timeout_seconds` (default `60`),
+`confirmation_on_timeout` (`"decline"` | `"confirm"`, default decline).
+
 ## Visuals (charts, tables, KPI tiles, images)
 
 The model can render structured visuals in the host UI by calling the

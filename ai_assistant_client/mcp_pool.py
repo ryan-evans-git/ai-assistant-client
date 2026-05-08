@@ -70,6 +70,11 @@ class RemoteTool:
     name: str
     description: str
     input_schema: dict[str, Any]
+    # Optional HITL block extracted from the MCP Tool's
+    # ``annotations.aai`` field.  ``None`` for tools that don't
+    # advertise human-in-the-loop metadata — they dispatch
+    # immediately like before.
+    hitl: dict[str, Any] | None = None
 
 
 class McpPool:
@@ -154,6 +159,7 @@ class McpPool:
                         name=tool.name,
                         description=tool.description or "",
                         input_schema=tool.inputSchema,
+                        hitl=_extract_hitl_annotation(tool),
                     )
                 )
         return out
@@ -170,6 +176,28 @@ class McpPool:
         result = await session.call_tool(upstream_name, arguments=arguments)
         # MCP returns a list of content items; flatten to text.
         return _result_to_text(result)
+
+
+def _extract_hitl_annotation(tool: Any) -> dict[str, Any] | None:
+    """Pull the ``annotations.aai`` payload off an MCP ``Tool``.
+
+    Servers that advertise a human-in-the-loop policy embed it under a
+    vendor-prefixed key (see ai-assistant-server's _tool_to_mcp).  The
+    SDK exposes ``annotations`` as a ToolAnnotations model that
+    accepts arbitrary extra fields, so we read the attribute and fall
+    back to a dict access for hand-rolled wrappers in tests.
+    """
+    annotations = getattr(tool, "annotations", None)
+    if annotations is None:
+        return None
+    aai = getattr(annotations, "aai", None)
+    if aai is None and isinstance(annotations, dict):
+        aai = annotations.get("aai")
+    if not isinstance(aai, dict):
+        return None
+    if not aai.get("requires_confirmation"):
+        return None
+    return dict(aai)
 
 
 def _result_to_text(result: Any) -> str:
