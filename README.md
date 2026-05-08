@@ -237,6 +237,53 @@ Tunables on `AgentRunConfig`:
 `confirmation_default_timeout_seconds` (default `60`),
 `confirmation_on_timeout` (`"decline"` | `"confirm"`, default decline).
 
+## Multi-step workflows
+
+For flows that need to pause at multiple checkpoints — draft →
+review → send, batch with mid-run progress, etc. — drop a Python
+file under the workflows directory (default `./workflows`,
+override with `WORKFLOWS_DIR`):
+
+```python
+# workflows/my_workflows.py
+from ai_assistant_client.workflows import (
+    workflow, pause_for_confirmation, emit_status,
+)
+
+@workflow(
+    name="draft_review_send_email",
+    description="Draft, review, and send an email with two pauses.",
+)
+async def draft_review_send_email(*, to: str, subject: str, instructions: str) -> dict:
+    await emit_status("Drafting…")
+    draft = generate_draft(instructions)
+    review = await pause_for_confirmation(
+        message="Review draft?",
+        preview={"to": to, "subject": subject, "draft": draft},
+    )
+    if review.decision == "decline":
+        return {"sent": False, "reason": review.note}
+    final = await pause_for_confirmation(message="Send now?")
+    if final.decision == "decline":
+        return {"sent": False}
+    await emit_status("Sending…")
+    return {"sent": True}
+```
+
+Workflows surface to the LLM as plain tools (name + description +
+JSON Schema derived from the signature) and are dispatched
+**inside the agent process**, not via MCP — that's what lets them
+pause for `pause_for_confirmation(...)` mid-execution. Each pause
+emits the same `tool_confirmation_request` event the per-tool
+gate uses, so the same UI handles both.
+
+`emit_status(message, data=...)` produces a `workflow_status` SSE
+event the host can render as inline progress.
+
+See `workflows/sample.py` for runnable examples
+(`approve_and_send_email`, `draft_review_send_email`,
+`bulk_archive_with_review`).
+
 ## Visuals (charts, tables, KPI tiles, images)
 
 The model can render structured visuals in the host UI by calling the

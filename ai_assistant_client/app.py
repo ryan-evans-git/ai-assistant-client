@@ -50,6 +50,10 @@ from ai_assistant_client.discovery import (
 )
 from ai_assistant_client.llm import LLMProvider, default_model, make_provider
 from ai_assistant_client.mcp_pool import McpPool, McpServerConfig
+from ai_assistant_client.workflows import (
+    WorkflowRegistry,
+    load_workflows_from_directory,
+)
 
 
 log = logging.getLogger(__name__)
@@ -64,6 +68,8 @@ _state: dict[str, Any] = {
     # Pending HITL confirmations.  Either an in-process map or a
     # Redis-backed pubsub store, picked from ``REDIS_URL`` env.
     "confirmations": None,
+    # Loaded workflows from WORKFLOWS_DIR.  Empty registry by default.
+    "workflows": None,
 }
 
 
@@ -89,6 +95,13 @@ def _load_server_configs() -> list[McpServerConfig]:
 
 @asynccontextmanager
 async def lifespan(app: Starlette) -> AsyncIterator[None]:
+    # Load client-side workflows first so we can register them in
+    # the same catalog as MCP-derived tools — the LLM should see
+    # both kinds in one progressive-discovery surface.
+    workflows_dir = os.environ.get("WORKFLOWS_DIR", "workflows")
+    workflows = load_workflows_from_directory(workflows_dir)
+    workflow_registry = WorkflowRegistry(workflows)
+
     configs = _load_server_configs()
     if configs:
         pool = await McpPool(configs).__aenter__()
@@ -103,6 +116,7 @@ async def lifespan(app: Starlette) -> AsyncIterator[None]:
                 )
                 for t in tools
             ]
+            descriptors.extend(workflow_registry.as_descriptors())
             registry = ProgressiveToolRegistry(descriptors)
             _state["pool"] = pool
             _state["registry"] = registry
@@ -112,7 +126,10 @@ async def lifespan(app: Starlette) -> AsyncIterator[None]:
     else:
         log.warning("No MCP_SERVERS configured — only the meta-tools will work")
         _state["pool"] = None
-        _state["registry"] = ProgressiveToolRegistry([])
+        _state["registry"] = ProgressiveToolRegistry(
+            workflow_registry.as_descriptors()
+        )
+    _state["workflows"] = workflow_registry
 
     # Confirmation store: in-process by default, Redis-backed when
     # REDIS_URL is set so multi-worker deployments can route a
@@ -142,6 +159,7 @@ async def lifespan(app: Starlette) -> AsyncIterator[None]:
         _state["registry"] = None
         _state["provider"] = None
         _state["confirmations"] = None
+        _state["workflows"] = None
 
 
 # ---------------------------------------------------------------------------
@@ -184,6 +202,7 @@ async def chat(request: Request) -> Response:
     config: AgentRunConfig = _state["config"]
     provider: LLMProvider = _state["provider"]
     store: PendingConfirmationStore | None = _state.get("confirmations")
+    workflow_registry: WorkflowRegistry | None = _state.get("workflows")
 
     async def dispatcher(name: str, arguments: dict[str, Any]) -> Any:
         if pool is None:
@@ -219,6 +238,7 @@ async def chat(request: Request) -> Response:
                 provider=provider,
                 config=config,
                 confirmation_hook=confirmation_hook,
+                workflow_registry=workflow_registry,
             ):
                 yield event.to_sse()
         except asyncio.CancelledError:

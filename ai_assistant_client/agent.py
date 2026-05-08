@@ -22,6 +22,7 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Literal
 
 from ai_assistant_client.confirmation_store import ConfirmationOutcome
 from ai_assistant_client.discovery import ProgressiveToolRegistry
+from ai_assistant_client.workflows import WorkflowRegistry, run_workflow
 from ai_assistant_client.llm import (
     CacheHint,
     LLMProvider,
@@ -141,6 +142,7 @@ async def run_agent(
     provider_name: str = "",
     auditor_provider: LLMProvider | None = None,
     confirmation_hook: ConfirmationHook | None = None,
+    workflow_registry: WorkflowRegistry | None = None,
 ) -> AsyncIterator[AgentEvent]:
     """Run one user turn end-to-end.
 
@@ -282,13 +284,20 @@ async def run_agent(
                     "tool_use", {"id": tu_id, "name": tool_name, "input": tool_input}
                 )
                 # ── Human-in-the-loop confirmation gate ─────────────
-                # Meta- and visual-tools never gate (they're inline);
-                # remote tools may carry HITL metadata that pauses
+                # Meta- and visual-tools never gate (they're inline).
+                # Workflows skip the per-tool gate too — their pauses
+                # are driven from inside the workflow body via
+                # pause_for_confirmation(), not before dispatch.
+                # Remote tools may carry HITL metadata that pauses
                 # dispatch until the user approves via the UI.
                 gate_outcome: ConfirmationOutcome | None = None
+                is_workflow_call = bool(
+                    workflow_registry and workflow_registry.get(tool_name)
+                )
                 if (
                     not registry.is_meta_tool(tool_name)
                     and not registry.is_visual_tool(tool_name)
+                    and not is_workflow_call
                 ):
                     descriptor = registry.get_descriptor(tool_name)
                     hitl = (descriptor.hitl if descriptor else None) or None
@@ -352,6 +361,42 @@ async def run_agent(
                                 },
                             )
                             result_text = _summarize_visual(envelope)
+                    elif is_workflow_call:
+                        wf = workflow_registry.get(tool_name)  # type: ignore[union-attr]
+                        assert wf is not None  # guarded by is_workflow_call
+                        wf_value: Any = None
+                        wf_error: str | None = None
+                        async for wf_event in run_workflow(
+                            wf,
+                            tool_input if isinstance(tool_input, dict) else {},
+                            tool_use_id=tu_id,
+                            confirmation_hook=confirmation_hook,
+                            default_timeout_seconds=config.confirmation_default_timeout_seconds,
+                            on_timeout_decision=config.confirmation_on_timeout,
+                        ):
+                            if wf_event.type == "status":
+                                yield AgentEvent(
+                                    "workflow_status", wf_event.payload or {}
+                                )
+                            elif wf_event.type == "confirmation_request":
+                                yield AgentEvent(
+                                    "tool_confirmation_request",
+                                    wf_event.payload or {},
+                                )
+                            elif wf_event.type == "confirmation_resolved":
+                                yield AgentEvent(
+                                    "tool_confirmation_resolved",
+                                    wf_event.payload or {},
+                                )
+                            elif wf_event.type == "result":
+                                wf_value = wf_event.value
+                            elif wf_event.type == "error":
+                                wf_error = wf_event.error
+                        if wf_error is not None:
+                            raise RuntimeError(wf_error)
+                        result_text = (
+                            wf_value if isinstance(wf_value, str) else _to_text(wf_value)
+                        )
                     elif registry.is_known_tool(tool_name):
                         result = await dispatcher(tool_name, tool_input)
                         result_text = result if isinstance(result, str) else _to_text(result)
