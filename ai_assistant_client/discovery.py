@@ -54,6 +54,12 @@ class RemoteToolDescriptor:
     description: str
     input_schema: dict[str, Any]
     tags: tuple[str, ...] = ()
+    # HITL block forwarded from MCP ``Tool.annotations.aai`` when the
+    # upstream tool wants user confirmation before dispatch.  ``None``
+    # means "no gate, run immediately."  Carried alongside the
+    # descriptor so the agent loop can read it without re-walking the
+    # MCP catalog on every tool_use.
+    hitl: dict[str, Any] | None = None
 
 
 class ProgressiveToolRegistry:
@@ -107,6 +113,14 @@ class ProgressiveToolRegistry:
             or self.is_meta_tool(name)
             or self.is_visual_tool(name)
         )
+
+    def get_descriptor(self, name: str) -> RemoteToolDescriptor | None:
+        """Return the catalog descriptor for ``name`` (or ``None``).
+
+        Used by the agent loop to read per-tool metadata (HITL,
+        future flags) without exposing the catalog dict.
+        """
+        return self._catalog.get(name)
 
     def anthropic_tools(self) -> list[dict[str, Any]]:
         """Tools to include in the next ``messages.create`` call.

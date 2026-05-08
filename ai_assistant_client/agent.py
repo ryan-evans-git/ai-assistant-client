@@ -14,10 +14,13 @@ Yields :class:`AgentEvent` instances suitable for SSE serialization.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import uuid
 from dataclasses import asdict, dataclass, field
 from typing import Any, AsyncIterator, Awaitable, Callable, Literal
 
+from ai_assistant_client.confirmation_store import ConfirmationOutcome
 from ai_assistant_client.discovery import ProgressiveToolRegistry
 from ai_assistant_client.llm import (
     CacheHint,
@@ -109,6 +112,23 @@ class AgentRunConfig:
     # block too).
     max_image_data_uri_kb: int = DEFAULT_MAX_IMAGE_DATA_URI_KB
 
+    # ---------------------------------------------------------------
+    # Human-in-the-loop confirmation
+    # ---------------------------------------------------------------
+    # Tools whose upstream metadata says ``requires_confirmation=True``
+    # pause the agent before dispatch.  The agent emits a
+    # ``tool_confirmation_request`` event the host routes to the UI;
+    # the host answers via the registered confirmation hook.
+    # ``confirmation_default_timeout_seconds`` is the wait used when
+    # the tool's own ``timeout_seconds`` is unset.  ``confirmation_on_timeout``
+    # decides whether an unanswered prompt counts as a decline (safe
+    # default — destructive ops shouldn't auto-run) or a confirm.
+    confirmation_default_timeout_seconds: int = 60
+    confirmation_on_timeout: Literal["decline", "confirm"] = "decline"
+
+
+ConfirmationHook = Callable[[dict[str, Any]], Awaitable["ConfirmationOutcome"]]
+
 
 async def run_agent(
     *,
@@ -120,6 +140,7 @@ async def run_agent(
     config: AgentRunConfig,
     provider_name: str = "",
     auditor_provider: LLMProvider | None = None,
+    confirmation_hook: ConfirmationHook | None = None,
 ) -> AsyncIterator[AgentEvent]:
     """Run one user turn end-to-end.
 
@@ -260,6 +281,49 @@ async def run_agent(
                 yield AgentEvent(
                     "tool_use", {"id": tu_id, "name": tool_name, "input": tool_input}
                 )
+                # ── Human-in-the-loop confirmation gate ─────────────
+                # Meta- and visual-tools never gate (they're inline);
+                # remote tools may carry HITL metadata that pauses
+                # dispatch until the user approves via the UI.
+                gate_outcome: ConfirmationOutcome | None = None
+                if (
+                    not registry.is_meta_tool(tool_name)
+                    and not registry.is_visual_tool(tool_name)
+                ):
+                    descriptor = registry.get_descriptor(tool_name)
+                    hitl = (descriptor.hitl if descriptor else None) or None
+                    if hitl and hitl.get("requires_confirmation"):
+                        async for ev, outcome in _gate_confirmation(
+                            tu_id=tu_id,
+                            tool_name=tool_name,
+                            tool_description=descriptor.description if descriptor else "",
+                            tool_input=tool_input,
+                            hitl=hitl,
+                            confirmation_hook=confirmation_hook,
+                            config=config,
+                        ):
+                            if ev is not None:
+                                yield ev
+                            if outcome is not None:
+                                gate_outcome = outcome
+                if gate_outcome is not None and gate_outcome.decision == "decline":
+                    note = gate_outcome.note or ""
+                    decline_text = (
+                        f"User declined: {note}" if note else "User declined."
+                    )
+                    tool_result_content.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tu_id,
+                            "is_error": True,
+                            "content": decline_text,
+                        }
+                    )
+                    yield AgentEvent(
+                        "tool_result",
+                        {"id": tu_id, "content": decline_text, "is_error": True},
+                    )
+                    continue
                 try:
                     if registry.is_meta_tool(tool_name):
                         result_text = registry.handle_meta_call(tool_name, tool_input)
@@ -291,6 +355,14 @@ async def run_agent(
                     elif registry.is_known_tool(tool_name):
                         result = await dispatcher(tool_name, tool_input)
                         result_text = result if isinstance(result, str) else _to_text(result)
+                        if gate_outcome is not None and gate_outcome.note:
+                            # User attached a note when confirming —
+                            # prepend it so the model sees the operator's
+                            # rationale alongside the tool's output.
+                            result_text = (
+                                f"User confirmed (note: {gate_outcome.note})\n"
+                                f"{result_text}"
+                            )
                     else:
                         result_text = (
                             f"Tool '{tool_name}' isn't available. "
@@ -372,6 +444,79 @@ async def run_agent(
             "validation_retry",
             {"retries_remaining": retries_remaining, "feedback_preview": feedback[:200]},
         )
+
+
+async def _gate_confirmation(
+    *,
+    tu_id: str,
+    tool_name: str,
+    tool_description: str,
+    tool_input: Any,
+    hitl: dict[str, Any],
+    confirmation_hook: ConfirmationHook | None,
+    config: AgentRunConfig,
+) -> AsyncIterator[tuple["AgentEvent | None", "ConfirmationOutcome | None"]]:
+    """Pause the agent before dispatching a HITL-flagged tool.
+
+    Yields ``(event, outcome)`` tuples — at least one event (the
+    confirmation_request) followed by a ``(None, outcome)`` carrying
+    the user's decision.  When no hook is registered, treats the
+    request as auto-confirmed (so a host that hasn't wired HITL
+    yet doesn't deadlock — it just behaves like the old immediate-
+    dispatch path).
+
+    The request_id is a fresh UUID per pause; the UI's `tool_use_id`
+    field maps to the LLM's tool_use id so multiple pauses inside
+    one workflow can each have a unique id.
+    """
+    request_id = f"conf_{uuid.uuid4().hex}"
+    timeout = (
+        hitl.get("timeout_seconds")
+        or config.confirmation_default_timeout_seconds
+    )
+    payload: dict[str, Any] = {
+        "request_id": request_id,
+        "tool_use_id": tu_id,
+        "tool_name": tool_name,
+        "tool_description": tool_description,
+        "tool_input": tool_input,
+        "timeout_seconds": int(timeout),
+    }
+    if hitl.get("message"):
+        payload["message"] = hitl["message"]
+    yield AgentEvent("tool_confirmation_request", payload), None
+
+    if confirmation_hook is None:
+        # No host-installed hook → fall back to confirm so the chat
+        # doesn't wedge.  The agent still emitted the request event,
+        # so an attached UI gets a chance to show the modal even if
+        # the host hasn't wired the resolution path yet.
+        log.warning(
+            "Tool %r marked HITL but no confirmation_hook registered; "
+            "auto-confirming.  Wire confirmation_hook to enforce.",
+            tool_name,
+        )
+        outcome = ConfirmationOutcome(decision="confirm")
+    else:
+        try:
+            outcome = await asyncio.wait_for(
+                confirmation_hook(payload), timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            outcome = ConfirmationOutcome(
+                decision=config.confirmation_on_timeout,
+                note="confirmation timed out",
+            )
+    yield AgentEvent(
+        "tool_confirmation_resolved",
+        {
+            "request_id": request_id,
+            "tool_use_id": tu_id,
+            "decision": outcome.decision,
+            "note": outcome.note,
+        },
+    ), None
+    yield None, outcome
 
 
 def _safe_json(text: str) -> Any:

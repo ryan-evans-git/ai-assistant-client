@@ -31,6 +31,11 @@ anthropic = ["anthropic>=0.40.0"]
 openai = ["openai>=1.40.0"]
 gemini = ["google-genai>=0.3.0"]
 bedrock = ["boto3>=1.34.0"]
+# Multi-worker pubsub backbone for routing HITL confirmations
+# (a POST /chat/confirm may land on a different worker than the
+# one streaming the chat).  Single-worker dev defaults to the
+# in-memory store and doesn't need this.
+redis = ["redis>=5.0.0"]
 all = [
     "anthropic>=0.40.0",
     "openai>=1.40.0",
@@ -43,6 +48,8 @@ dev = [
     "pytest-cov>=5.0.0",
     "ruff>=0.4.0",
     "respx>=0.21.0",
+    "redis>=5.0.0",
+    "fakeredis>=2.20.0",
 ]
 
 [project.scripts]
