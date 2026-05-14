@@ -50,10 +50,27 @@ from ai_assistant_client.discovery import (
 )
 from ai_assistant_client.llm import LLMProvider, default_model, make_provider
 from ai_assistant_client.mcp_pool import McpPool, McpServerConfig
+from ai_assistant_client.persistence import (
+    TranscriptStore,
+    make_transcript_store,
+)
 from ai_assistant_client.workflows import (
     WorkflowRegistry,
     load_workflows_from_directory,
 )
+
+
+# Env flag that opts every dispatched workflow into transcript
+# recording.  Accepts the usual truthy variants ("1", "true",
+# "yes", "on") — anything else (or unset) is off.  The store
+# itself is picked by :func:`make_transcript_store` from its own
+# env vars (AAC_TRANSCRIPT_BACKEND etc.).
+RECORDING_ENV = "AAC_WORKFLOW_RECORDING"
+
+
+def _recording_enabled() -> bool:
+    raw = os.environ.get(RECORDING_ENV, "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
 
 
 log = logging.getLogger(__name__)
@@ -70,6 +87,10 @@ _state: dict[str, Any] = {
     "confirmations": None,
     # Loaded workflows from WORKFLOWS_DIR.  Empty registry by default.
     "workflows": None,
+    # Transcript store for workflow recording.  Populated when
+    # AAC_WORKFLOW_RECORDING is truthy; otherwise None and the
+    # agent loop uses the plain (non-recording) dispatch.
+    "transcripts": None,
 }
 
 
@@ -131,6 +152,17 @@ async def lifespan(app: Starlette) -> AsyncIterator[None]:
         )
     _state["workflows"] = workflow_registry
 
+    # Transcript store — only constructed when recording is on so
+    # a default deployment doesn't open files / databases it doesn't
+    # need.  The backend itself is picked by make_transcript_store()
+    # from its own env vars (AAC_TRANSCRIPT_BACKEND / _DIR / _SQLITE_PATH).
+    if _recording_enabled():
+        _state["transcripts"] = make_transcript_store()
+        log.info("Workflow recording enabled (backend: %s)",
+                 type(_state["transcripts"]).__name__)
+    else:
+        _state["transcripts"] = None
+
     # Confirmation store: in-process by default, Redis-backed when
     # REDIS_URL is set so multi-worker deployments can route a
     # POST /chat/confirm to whichever worker owns the SSE stream.
@@ -160,6 +192,7 @@ async def lifespan(app: Starlette) -> AsyncIterator[None]:
         _state["provider"] = None
         _state["confirmations"] = None
         _state["workflows"] = None
+        _state["transcripts"] = None
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +236,7 @@ async def chat(request: Request) -> Response:
     provider: LLMProvider = _state["provider"]
     store: PendingConfirmationStore | None = _state.get("confirmations")
     workflow_registry: WorkflowRegistry | None = _state.get("workflows")
+    transcript_store: TranscriptStore | None = _state.get("transcripts")
 
     async def dispatcher(name: str, arguments: dict[str, Any]) -> Any:
         if pool is None:
@@ -239,6 +273,7 @@ async def chat(request: Request) -> Response:
                 config=config,
                 confirmation_hook=confirmation_hook,
                 workflow_registry=workflow_registry,
+                transcript_store=transcript_store,
             ):
                 yield event.to_sse()
         except asyncio.CancelledError:
@@ -307,13 +342,72 @@ def build_app() -> Starlette:
 app = build_app()
 
 
-def main() -> int:
-    import uvicorn
+def main(argv: list[str] | None = None) -> int:
+    """CLI entrypoint.
+
+    Three sub-commands:
+
+    * (no args) — serve the HTTP / SSE chat endpoint (the
+      original / default behaviour).  Recording is opted in via
+      ``AAC_WORKFLOW_RECORDING=on``; the backend is picked by
+      ``AAC_TRANSCRIPT_BACKEND`` (memory / file / sqlite).
+    * ``replay <run_id>`` — read a recorded workflow run from the
+      transcript store and emit each event as a JSON line on
+      stdout.  Offline; doesn't bind a port.
+    * ``graph <run_id> [--kind flowchart|sequence]`` — render
+      the recorded run as a Mermaid diagram on stdout.  Pair with
+      ``> diagram.mmd`` or pipe into ``mmdc`` for an SVG.
+
+    Both offline sub-commands honour the same env vars used by
+    the server, so a recording captured by the server is
+    immediately legible to ``replay`` / ``graph`` without extra
+    configuration.
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="ai-assistant-client",
+        description=(
+            "Streaming chat client. Run with no arguments to serve "
+            "the SSE chat endpoint; use 'replay' / 'graph' for "
+            "offline inspection of recorded workflow runs."
+        ),
+    )
+    subparsers = parser.add_subparsers(dest="command")
+
+    replay_parser = subparsers.add_parser(
+        "replay",
+        help="Emit recorded workflow events as JSON lines on stdout.",
+    )
+    replay_parser.add_argument("run_id", help="Run id to replay.")
+
+    graph_parser = subparsers.add_parser(
+        "graph",
+        help="Render a recorded workflow run as a Mermaid diagram.",
+    )
+    graph_parser.add_argument("run_id", help="Run id to render.")
+    graph_parser.add_argument(
+        "--kind",
+        choices=("flowchart", "sequence"),
+        default="flowchart",
+        help="Mermaid diagram kind (default: flowchart).",
+    )
+
+    args = parser.parse_args(argv)
 
     logging.basicConfig(
         level=os.environ.get("AI_ASSISTANT_CLIENT_LOG_LEVEL", "INFO"),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+
+    if args.command == "replay":
+        return asyncio.run(_cli_replay(args.run_id))
+    if args.command == "graph":
+        return asyncio.run(_cli_graph(args.run_id, kind=args.kind))
+
+    # Default: serve.
+    import uvicorn
+
     host = os.environ.get("AI_ASSISTANT_CLIENT_HOST", "127.0.0.1")
     port = int(os.environ.get("AI_ASSISTANT_CLIENT_PORT", "8080"))
     uvicorn.run(
@@ -323,6 +417,47 @@ def main() -> int:
         log_level="info",
         reload=False,
     )
+    return 0
+
+
+async def _cli_replay(run_id: str) -> int:
+    """Stream recorded events as JSON lines.
+
+    Returns ``0`` on success, ``1`` if the run id is unknown.
+    The transcript store is built from the same env vars the
+    server uses, so a host can record on one process and replay
+    from another against the same backend.
+
+    Defined async (rather than synchronous + an internal
+    ``asyncio.run``) so tests can await it directly inside the
+    pytest-asyncio event loop without nesting ``asyncio.run``
+    calls.  :func:`main` does the ``asyncio.run`` for the CLI.
+    """
+    import json
+    from dataclasses import asdict
+
+    store = make_transcript_store()
+    try:
+        transcript = await store.read(run_id)
+    except KeyError:
+        print(f"unknown run id: {run_id!r}", flush=True)
+        return 1
+    for event in transcript.events:
+        print(json.dumps(asdict(event), default=str), flush=True)
+    return 0
+
+
+async def _cli_graph(run_id: str, *, kind: str) -> int:
+    """Render a recorded run as a Mermaid diagram on stdout."""
+    from ai_assistant_client.workflows.graph import transcript_to_mermaid
+
+    store = make_transcript_store()
+    try:
+        transcript = await store.read(run_id)
+    except KeyError:
+        print(f"unknown run id: {run_id!r}", flush=True)
+        return 1
+    print(transcript_to_mermaid(transcript, kind=kind))  # type: ignore[arg-type]
     return 0
 
 

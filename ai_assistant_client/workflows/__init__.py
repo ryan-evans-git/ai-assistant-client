@@ -53,6 +53,16 @@ from ai_assistant_client.workflows.runtime import (
 )
 
 
+# Note: ``replay_workflow`` / ``run_workflow_recording`` live in
+# :mod:`ai_assistant_client.workflows.replay` and are NOT re-exported
+# here.  Replay depends on :mod:`ai_assistant_client.persistence`,
+# which in turn imports :class:`WorkflowEvent` from this package —
+# re-exporting from the package root would force the persistence
+# layer to load through this ``__init__`` during its own init and
+# produce a circular import.  Callers import the replay helpers
+# directly from the submodule.
+
+
 __all__ = [
     "Workflow",
     "WorkflowContext",

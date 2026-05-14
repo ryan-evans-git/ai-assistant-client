@@ -284,6 +284,355 @@ See `workflows/sample.py` for runnable examples
 (`approve_and_send_email`, `draft_review_send_email`,
 `bulk_archive_with_review`).
 
+### Record & replay
+
+Workflow runs can be recorded to a pluggable transcript store and
+replayed later — useful for regression tests, demos, and forensic
+"what actually happened in run X" inspection.
+
+```python
+from ai_assistant_client.persistence import make_transcript_store
+from ai_assistant_client.workflows.replay import (
+    replay_workflow, run_workflow_recording,
+)
+
+store = make_transcript_store()  # default: in-memory
+
+# Record:
+async for event in run_workflow_recording(
+    wf, args, tool_use_id="tu", confirmation_hook=hook,
+    store=store, run_id="run-2026-05-14-...",
+):
+    ...
+
+# Replay (handler is NOT re-invoked; events come from the store):
+async for event in replay_workflow(store, "run-2026-05-14-..."):
+    ...
+```
+
+Pick the backend by env var:
+
+| Env var | Values | Notes |
+|---|---|---|
+| `AAC_TRANSCRIPT_BACKEND` | `memory` *(default)* / `file` / `sqlite` | Postgres / MySQL / Aurora use `SqlTranscriptStore` with a caller-built connection — see [SQL backends](#sql-backends-aurora-postgres-mysql-rds) below. |
+| `AAC_TRANSCRIPT_DIR` | path | Base directory for the `file` backend; defaults to `./transcripts`. One `.jsonl` file per run id. |
+| `AAC_TRANSCRIPT_SQLITE_PATH` | path | Path to the sqlite file for the `sqlite` backend; defaults to `./transcripts.sqlite3`. |
+
+A parallel `ConversationStore` (below) handles open-ended chat
+history. Adding a new backend (SQL on a local sqlite, SQL on a
+managed cloud DB, etc.) is one class implementing the relevant
+protocol; no application code changes.
+
+Replay records the workflow boundary (input args + emitted
+events + outcome). It does **not** mock tool calls inside the
+handler — for that, write the workflow to inject its tool
+dependencies and pass mocks at test time.
+
+### Recording, replay, and graph viz from the CLI
+
+Set `AAC_WORKFLOW_RECORDING=on` and every workflow the agent
+dispatches gets recorded into whichever transcript backend
+you've configured. Then inspect runs offline with the
+sub-commands:
+
+```bash
+# Run the server with recording on.
+AAC_WORKFLOW_RECORDING=on \
+AAC_TRANSCRIPT_BACKEND=sqlite \
+AAC_TRANSCRIPT_SQLITE_PATH=./transcripts.sqlite3 \
+ai-assistant-client
+
+# In another shell: list / replay / draw a recorded run.
+ai-assistant-client replay wf_send_email_abc123           # JSON lines on stdout
+ai-assistant-client graph wf_send_email_abc123             # Mermaid flowchart
+ai-assistant-client graph wf_send_email_abc123 --kind sequence
+```
+
+Both sub-commands read the same env vars the server writes
+with, so a run recorded on one process is immediately
+inspectable from another. Unknown run ids exit non-zero so a
+shell pipeline can fail loudly.
+
+### Visualize a recorded run programmatically
+
+Any `RunTranscript` (in-memory, file, or SQL backend) renders to
+a Mermaid diagram — useful for embedding in PR descriptions,
+runbooks, or static documentation:
+
+```python
+from ai_assistant_client.workflows.graph import transcript_to_mermaid
+
+transcript = await store.read("run-2026-05-14-...")
+print(transcript_to_mermaid(transcript))                # flowchart (default)
+print(transcript_to_mermaid(transcript, kind="sequence"))
+print(transcript_to_mermaid(transcript, kind="gantt"))  # timing chart
+```
+
+The output is a self-contained Mermaid block — wrap it in
+` ```mermaid … ``` ` fences and GitHub / GitLab / Notion will
+render it natively. Confirmation pauses become decision
+diamonds in the flowchart; `result` and `error` terminal nodes
+carry style classes so successes and failures are visually
+distinct.
+
+The **Gantt** variant uses the per-event timestamps to show
+when each step happened and how long the wait between events
+was — useful for latency analysis and for visualising how much
+wall time a run spent paused on user confirmation vs. doing
+work. Events without timestamps (pre-timestamp recordings) are
+skipped; if no events have timestamps the chart renders just
+the skeleton so the caller can detect the empty case.
+
+## Conversation history persistence
+
+`run_agent` accepts an optional `(conversation_store, conversation_id)`
+pair. When both are set, every message the agent appends to
+`history` (the user turn, each assistant turn, each tool_result
+turn, validation-retry feedback) is mirrored into the store
+under that id:
+
+```python
+from ai_assistant_client.persistence import make_conversation_store
+
+store = make_conversation_store()  # default: in-memory
+async for event in run_agent(
+    user_message="hello",
+    history=await store.read("conv-123"),  # seed from prior turns
+    ...,
+    conversation_store=store,
+    conversation_id="conv-123",
+):
+    ...
+```
+
+The store is **write-only from the agent's perspective** — seeding
+`history` from prior turns is the caller's responsibility (so
+the read path stays a host-side decision, not a hidden side
+effect). When `conversation_store` or `conversation_id` is
+`None`, persistence is silently disabled.
+
+Pick the backend by env var, independently from the transcript
+store:
+
+| Env var | Values | Notes |
+|---|---|---|
+| `AAC_CONVERSATION_BACKEND` | `memory` *(default)* / `file` / `sqlite` | Postgres / MySQL / Aurora use `SqlConversationStore` with a caller-built connection — see [SQL backends](#sql-backends-aurora-postgres-mysql-rds) below. |
+| `AAC_CONVERSATION_DIR` | path | Base directory for the `file` backend; defaults to `./conversations`. One `.jsonl` file per conversation id. |
+| `AAC_CONVERSATION_SQLITE_PATH` | path | Path to the sqlite file for the `sqlite` backend; defaults to `./conversations.sqlite3`. |
+
+## SQL backends (Aurora, Postgres, MySQL, RDS)
+
+For durable, multi-host deployments, both stores ship a DB-API 2.0
+backend that works with any compliant driver — covering
+**sqlite** (stdlib), **PostgreSQL** (incl. AWS Aurora PG +
+RDS Proxy), and **MySQL** (incl. Aurora MySQL):
+
+```python
+import psycopg  # or psycopg2, pg8000, PyMySQL, mysqlclient, mysql-connector-python
+from ai_assistant_client.persistence import (
+    Dialect, SqlTranscriptStore, SqlConversationStore,
+)
+
+conn = psycopg.connect("postgresql://...")
+transcripts = SqlTranscriptStore(conn, dialect=Dialect.POSTGRESQL)
+conversations = SqlConversationStore(conn, dialect=Dialect.POSTGRESQL)
+```
+
+Why this shape:
+
+- **Zero new dependencies in this package.** You install whichever driver matches your DB. Keeps the credential surface to first-party drivers you've already vetted, in the same spirit as the [no-LiteLLM rationale](#why-a-custom-provider-abstraction-and-not-litellmaisuite).
+- **Caller owns the connection.** IAM token minting, TLS config, RDS Proxy endpoints, and pooling all stay upstream where they belong.
+- **Aurora Serverless v2** uses standard wire protocol — same drivers work. (Aurora Serverless v1's HTTP Data API is the one path that *doesn't* work via DB-API — but v1 is the legacy variant.)
+- **Schema is created on first use** (`CREATE TABLE IF NOT EXISTS`). Tables: `aac_transcript_runs`, `aac_transcript_events`, `aac_conversation_messages`.
+
+Known limitation (v1): the per-id `seq` is computed as `SELECT COALESCE(MAX(seq), 0) + 1` inside a transaction. Within one process the store's `asyncio.Lock` makes this safe; **cross-process concurrent writes to the same id** are racy and may collide on the `(id, seq)` unique constraint. Workflow runs each get a unique `run_id` so this rarely bites in practice — but if you fan recorders across processes writing to one conversation, run a single leader recorder or switch to a per-id database sequence.
+
+### Native-async drivers (asyncpg / aiomysql)
+
+The DB-API path covers every supported engine via a worker
+thread (`asyncio.to_thread`). For hosts that want to avoid that
+hop under high recording throughput, drop-in native-async
+implementations are available:
+
+```bash
+pip install "ai-assistant-client[asyncpg]"   # PostgreSQL incl. Aurora PG
+pip install "ai-assistant-client[aiomysql]"  # MySQL incl. Aurora MySQL
+```
+
+```python
+import asyncpg
+from ai_assistant_client.persistence import (
+    AsyncpgTranscriptStore, AsyncpgConversationStore,
+)
+
+pool = await asyncpg.create_pool("postgresql://...")
+transcripts = AsyncpgTranscriptStore(pool)
+conversations = AsyncpgConversationStore(pool)
+```
+
+```python
+import aiomysql
+from ai_assistant_client.persistence import (
+    AiomysqlTranscriptStore, AiomysqlConversationStore,
+)
+
+pool = await aiomysql.create_pool(host=..., user=..., password=..., db=...)
+transcripts = AiomysqlTranscriptStore(pool)
+conversations = AiomysqlConversationStore(pool)
+```
+
+Schema is byte-equivalent to what the DB-API stores create — you
+can switch between the sync and async paths against the same
+database without migrations.
+
+### Migrating an existing schema
+
+`CREATE TABLE IF NOT EXISTS` (the stores' bootstrap) doesn't
+touch existing tables when a column is added in a later release.
+For operators with pre-existing data, idempotent migration
+helpers are available:
+
+```python
+from ai_assistant_client.persistence import (
+    Dialect, ensure_transcript_events_ts_column,
+)
+
+# Run once at startup after upgrading.  Returns True if the
+# column was added, False if it was already there.
+ensure_transcript_events_ts_column(conn, dialect=Dialect.POSTGRESQL)
+```
+
+Handles all three dialects portably (sqlite uses `PRAGMA
+table_info`; PostgreSQL uses `ADD COLUMN IF NOT EXISTS`; MySQL
+swallows the duplicate-column error on a concurrent add). The
+generic helper `add_column_if_missing(conn, dialect=..., table=...,
+column=..., column_type_sql=..., default_sql=...)` covers any
+future column additions.
+
+## Per-user memory (storage foundation)
+
+A separate `MemoryStore` protocol for durable typed notes the
+host attaches to a user — survives across conversations and is
+the building block for personalisation features ("user prefers
+concise replies", "user is a data scientist").
+
+```python
+from ai_assistant_client.persistence import make_memory_store
+
+store = make_memory_store()  # default: in-process
+record = await store.add(
+    user_id="alice",
+    key="role",
+    value="data scientist",
+    tags=("work",),
+)
+later = await store.list(user_id="alice", tags=("work",))
+await store.forget_all(user_id="alice")  # GDPR-style erasure
+```
+
+| Env var | Values | Notes |
+|---|---|---|
+| `AAC_MEMORY_BACKEND` | `local` *(default)* / `file` / `sqlite` | Postgres / MySQL / Aurora use `SqlMemoryStore` / `AsyncpgMemoryStore` / `AiomysqlMemoryStore` with a caller-built connection. |
+| `AAC_MEMORY_DIR` | path | Base directory for the `file` backend; defaults to `./memories`. One `.jsonl` file per user id. |
+| `AAC_MEMORY_SQLITE_PATH` | path | Path to the sqlite file for the `sqlite` backend; defaults to `./memories.sqlite3`. |
+
+```python
+import psycopg
+from ai_assistant_client.persistence import (
+    Dialect, SqlMemoryStore, AsyncpgMemoryStore,
+)
+
+# DB-API 2.0 — sqlite / Postgres / MySQL / Aurora via any compliant driver.
+conn = psycopg.connect("postgresql://...")
+store = SqlMemoryStore(conn, dialect=Dialect.POSTGRESQL)
+
+# Or native-async for high-throughput Aurora PG / MySQL.
+import asyncpg
+pool = await asyncpg.create_pool("postgresql://...")
+store = AsyncpgMemoryStore(pool)
+```
+
+The SQL stores enforce per-user isolation at the SQL level
+(`WHERE memory_id = ? AND user_id = ?` on every operation) — a
+caller who knows another user's memory id can't read or mutate
+it. Tables: `aac_user_memories` plus a `(user_id, seq)` index
+for cheap `list()` reads.
+
+### Agent integration
+
+`run_agent` accepts a `memory_store` + `user_id` pair; when
+**both** are set, three LLM-callable meta-tools become available
+to the model alongside `tool_search` / `tool_load`:
+
+* `memory_recall(tags?)` — returns the user's memories as JSON.
+* `memory_remember(key, value, tags?)` — persists a new memory.
+* `memory_forget(memory_id)` — deletes a memory.
+
+```python
+from ai_assistant_client.persistence import make_memory_store
+
+store = make_memory_store()
+async for event in run_agent(
+    ...,
+    memory_store=store,
+    user_id=request_user_id,  # closed over — LLM can't spoof
+):
+    ...
+```
+
+Security: every meta-tool dispatch closes over `user_id` from
+the agent's context. An LLM tool-use that includes a `user_id`
+field in its arguments is ignored — the value comes from the
+host's call to `run_agent`, not from model output. The meta-
+tools stay invisible if either `memory_store` or `user_id` is
+`None` so a misconfig can't expose the recall surface without
+isolation.
+
+### System-prompt injection helper
+
+For hosts that want recalled memories visible to the LLM as
+context (rather than fetched on demand), `build_system_prompt_with_memory`
+produces the augmented prompt with the recommended
+injection-resistance envelope:
+
+```python
+from ai_assistant_client.memory_prompt import build_system_prompt_with_memory
+
+result = await build_system_prompt_with_memory(
+    base_system_prompt,
+    store=store,
+    user_id=request_user_id,
+    tags=("preference",),  # optional filter
+)
+config = AgentRunConfig(
+    ...,
+    system_prompt=result.system_prompt,
+)
+# Log which memories contributed so an incident can be traced.
+log.info("turn used memories: %s", result.memory_ids)
+```
+
+The helper wraps recalled content in a `<user_memory>...</user_memory>`
+delimiter and prepends a reminder telling the model to treat
+the contents as data, not instructions. **This is opt-in** —
+the agent doesn't auto-inject so the host keeps product
+decisions about which memories to surface, when.
+
+### Privacy invariants the protocol enforces
+
+- **Per-user isolation.** Every `get` / `update` / `remove` /
+  `list` takes a `user_id`. A memory written for user A is
+  unreachable to user B even if user B knows the id —
+  cross-user access raises the same `KeyError` as a missing
+  record so it can't be used as an enumeration oracle.
+- **GDPR-style erasure.** `forget_all(user_id=...)` removes
+  every record; the file backend deletes the user's file
+  outright (no tombstone). Returns the count so a host's
+  privacy endpoint can confirm to the user.
+- **Server-assigned ids.** Memory ids are opaque `mem_{hex}`
+  tokens generated by the store. Callers can't inject custom
+  ids that could traverse the filesystem in the file backend.
+
 ## Visuals (charts, tables, KPI tiles, images)
 
 The model can render structured visuals in the host UI by calling the

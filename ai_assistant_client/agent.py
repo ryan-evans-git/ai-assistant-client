@@ -22,7 +22,18 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Literal
 
 from ai_assistant_client.confirmation_store import ConfirmationOutcome
 from ai_assistant_client.discovery import ProgressiveToolRegistry
+from ai_assistant_client.memory_meta import (
+    handle_memory_meta_call,
+    is_memory_meta_tool,
+    memory_meta_tool_schemas,
+)
+from ai_assistant_client.persistence import (
+    ConversationStore,
+    MemoryStore,
+    TranscriptStore,
+)
 from ai_assistant_client.workflows import WorkflowRegistry, run_workflow
+from ai_assistant_client.workflows.replay import run_workflow_recording
 from ai_assistant_client.llm import (
     CacheHint,
     LLMProvider,
@@ -143,6 +154,11 @@ async def run_agent(
     auditor_provider: LLMProvider | None = None,
     confirmation_hook: ConfirmationHook | None = None,
     workflow_registry: WorkflowRegistry | None = None,
+    conversation_store: ConversationStore | None = None,
+    conversation_id: str | None = None,
+    transcript_store: TranscriptStore | None = None,
+    memory_store: MemoryStore | None = None,
+    user_id: str | None = None,
 ) -> AsyncIterator[AgentEvent]:
     """Run one user turn end-to-end.
 
@@ -164,11 +180,57 @@ async def run_agent(
     used for the auditor LLM when ``validation_mode`` is ``"audit"`` or
     ``"hybrid"``.  Defaults to ``provider``.
 
+    ``conversation_store`` + ``conversation_id``: when both are set,
+    every message appended to ``history`` is mirrored into the
+    store under that id.  This is *write-only* from the agent's
+    perspective — the caller is responsible for loading prior
+    turns out of the store and seeding ``history`` (so the
+    store-read path stays a host-side decision, not a hidden
+    side-effect of ``run_agent``).  Either ``None`` disables
+    persistence entirely.
+
+    ``transcript_store``: when set, every workflow dispatched
+    inside this turn is recorded via
+    :func:`run_workflow_recording`.  Run ids are auto-generated
+    as ``wf_{workflow_name}_{uuid}`` so they're human-recognisable
+    in store listings.  ``None`` (the default) keeps the
+    pre-recording dispatch path unchanged.
+
+    ``memory_store`` + ``user_id``: when **both** are set, the
+    LLM-callable memory meta-tools (``memory_recall``,
+    ``memory_remember``, ``memory_forget``) are surfaced to the
+    model.  All operations close over ``user_id`` from the
+    agent's context — the model can't pass a different one — so
+    per-user isolation is preserved at the dispatch layer too.
+    Either ``None`` and the memory tools stay invisible.
+
     History is stored in Anthropic-style block form regardless of
     which provider is in use; each provider adapter translates on
     the way out.
     """
-    history.append({"role": "user", "content": user_message})
+    # Only persist when BOTH a store and an id are provided — the
+    # combination is the well-formed shape, and silently ignoring
+    # half-configured persistence is exactly the kind of "did the
+    # data make it to disk?" ambiguity that bites later.
+    persist = conversation_store is not None and conversation_id is not None
+
+    # Same well-formed-shape rule for memory: tools only surface
+    # when both a store and a user id are wired, so a misconfig
+    # can't accidentally expose the recall surface without
+    # isolation.
+    memory_enabled = memory_store is not None and user_id is not None
+
+    async def _record(message: dict[str, Any]) -> None:
+        if persist:
+            # ``persist`` only becomes True when both checks pass,
+            # but the type-checker can't see that across the
+            # closure; the ``assert`` is for it, not for runtime.
+            assert conversation_store is not None and conversation_id is not None
+            await conversation_store.append(conversation_id, message)
+
+    user_turn = {"role": "user", "content": user_message}
+    history.append(user_turn)
+    await _record(user_turn)
     yield AgentEvent("user_message", {"content": user_message})
 
     effective_system_prompt = (
@@ -185,6 +247,12 @@ async def run_agent(
 
         for iteration in range(config.max_tool_iterations):
             tools = registry.anthropic_tools()
+            # Surface the memory meta-tools only when the host has
+            # wired both a store and a user_id.  Prepending keeps
+            # them at a stable position in the catalog so the
+            # prompt prefix stays cache-friendly turn over turn.
+            if memory_enabled:
+                tools = memory_meta_tool_schemas() + tools
             log.debug("Iteration %d: %d tools in window", iteration, len(tools))
 
             accumulated_text: list[str] = []
@@ -266,7 +334,9 @@ async def run_agent(
                         "input": tu["input"],
                     }
                 )
-            history.append({"role": "assistant", "content": assistant_blocks})
+            assistant_turn = {"role": "assistant", "content": assistant_blocks}
+            history.append(assistant_turn)
+            await _record(assistant_turn)
 
             if stop_reason != "tool_use" or not ordered_tool_uses:
                 last_assistant_text = joined_text
@@ -298,6 +368,7 @@ async def run_agent(
                     not registry.is_meta_tool(tool_name)
                     and not registry.is_visual_tool(tool_name)
                     and not is_workflow_call
+                    and not (memory_enabled and is_memory_meta_tool(tool_name))
                 ):
                     descriptor = registry.get_descriptor(tool_name)
                     hitl = (descriptor.hitl if descriptor else None) or None
@@ -334,7 +405,23 @@ async def run_agent(
                     )
                     continue
                 try:
-                    if registry.is_meta_tool(tool_name):
+                    if memory_enabled and is_memory_meta_tool(tool_name):
+                        # Memory meta-tools run inline like the other
+                        # meta-tools.  ``user_id`` comes from the
+                        # agent's context (closed over), not from
+                        # the LLM-supplied input — load-bearing for
+                        # cross-user isolation.
+                        assert memory_store is not None and user_id is not None
+                        memory_args = (
+                            tool_input if isinstance(tool_input, dict) else {}
+                        )
+                        result_text = await handle_memory_meta_call(
+                            tool_name,
+                            memory_args,
+                            store=memory_store,
+                            user_id=user_id,
+                        )
+                    elif registry.is_meta_tool(tool_name):
                         result_text = registry.handle_meta_call(tool_name, tool_input)
                     elif registry.is_visual_tool(tool_name):
                         # Validate the spec; emit the visual event when
@@ -366,14 +453,36 @@ async def run_agent(
                         assert wf is not None  # guarded by is_workflow_call
                         wf_value: Any = None
                         wf_error: str | None = None
-                        async for wf_event in run_workflow(
-                            wf,
-                            tool_input if isinstance(tool_input, dict) else {},
-                            tool_use_id=tu_id,
-                            confirmation_hook=confirmation_hook,
-                            default_timeout_seconds=config.confirmation_default_timeout_seconds,
-                            on_timeout_decision=config.confirmation_on_timeout,
-                        ):
+                        # Pick recording vs. plain dispatch based on
+                        # whether the host wired in a transcript
+                        # store.  Both return the same event
+                        # AsyncIterator shape, so the rest of the
+                        # loop is identical.
+                        wf_args = (
+                            tool_input if isinstance(tool_input, dict) else {}
+                        )
+                        if transcript_store is not None:
+                            run_id = f"wf_{wf.name}_{uuid.uuid4().hex}"
+                            wf_iter = run_workflow_recording(
+                                wf,
+                                wf_args,
+                                tool_use_id=tu_id,
+                                confirmation_hook=confirmation_hook,
+                                store=transcript_store,
+                                run_id=run_id,
+                                default_timeout_seconds=config.confirmation_default_timeout_seconds,
+                                on_timeout_decision=config.confirmation_on_timeout,
+                            )
+                        else:
+                            wf_iter = run_workflow(
+                                wf,
+                                wf_args,
+                                tool_use_id=tu_id,
+                                confirmation_hook=confirmation_hook,
+                                default_timeout_seconds=config.confirmation_default_timeout_seconds,
+                                on_timeout_decision=config.confirmation_on_timeout,
+                            )
+                        async for wf_event in wf_iter:
                             if wf_event.type == "status":
                                 yield AgentEvent(
                                     "workflow_status", wf_event.payload or {}
@@ -435,7 +544,9 @@ async def run_agent(
                         "tool_error", {"id": tu_id, "name": tool_name, "error": str(err)}
                     )
 
-            history.append({"role": "user", "content": tool_result_content})
+            tool_result_turn = {"role": "user", "content": tool_result_content}
+            history.append(tool_result_turn)
+            await _record(tool_result_turn)
 
         if not terminated_normally:
             yield AgentEvent(
@@ -483,7 +594,9 @@ async def run_agent(
         # hosts that want to hide it can detect the "[validation] "
         # prefix.
         feedback = build_retry_feedback(result)
-        history.append({"role": "user", "content": feedback})
+        feedback_turn = {"role": "user", "content": feedback}
+        history.append(feedback_turn)
+        await _record(feedback_turn)
         retries_remaining -= 1
         yield AgentEvent(
             "validation_retry",
