@@ -22,9 +22,11 @@ import asyncio
 from typing import Any
 
 from ai_assistant_client.persistence.sql_common import (
+    SEQ_COLLISION_MAX_ATTEMPTS,
     Dialect,
     adapt_sql,
     from_json,
+    is_integrity_error,
     to_json,
     transcript_events_ddl,
     transcript_runs_ddl,
@@ -141,32 +143,52 @@ class SqlTranscriptStore:
         )
 
         def _run() -> None:
-            cur = self._conn.cursor()
-            try:
-                cur.execute(select_run_sql, (run_id,))
-                if cur.fetchone() is None:
-                    raise KeyError(run_id)
-                cur.execute(next_seq_sql, (run_id,))
-                row = cur.fetchone()
-                next_seq = int(row[0]) if row and row[0] is not None else 1
-                cur.execute(
-                    insert_sql,
-                    (
-                        run_id,
-                        next_seq,
-                        event.type,
-                        to_json(event.payload) if event.payload is not None else None,
-                        to_json(event.value) if event.value is not None else None,
-                        event.error,
-                        event.timestamp,
-                    ),
-                )
-                self._conn.commit()
-            except Exception:
-                self._conn.rollback()
-                raise
-            finally:
-                cur.close()
+            # Retry loop around the SELECT-MAX(seq)+INSERT pattern.
+            # Within a single process the asyncio.Lock prevents
+            # collisions; this loop handles the cross-process case
+            # where another writer commits a row with the same
+            # ``seq`` between our SELECT and INSERT, producing an
+            # IntegrityError on the ``(run_id, seq)`` PK.
+            last_err: Exception | None = None
+            for _attempt in range(SEQ_COLLISION_MAX_ATTEMPTS):
+                cur = self._conn.cursor()
+                try:
+                    cur.execute(select_run_sql, (run_id,))
+                    if cur.fetchone() is None:
+                        raise KeyError(run_id)
+                    cur.execute(next_seq_sql, (run_id,))
+                    row = cur.fetchone()
+                    next_seq = int(row[0]) if row and row[0] is not None else 1
+                    cur.execute(
+                        insert_sql,
+                        (
+                            run_id,
+                            next_seq,
+                            event.type,
+                            to_json(event.payload) if event.payload is not None else None,
+                            to_json(event.value) if event.value is not None else None,
+                            event.error,
+                            event.timestamp,
+                        ),
+                    )
+                    self._conn.commit()
+                    return
+                except KeyError:
+                    self._conn.rollback()
+                    raise
+                except Exception as err:
+                    self._conn.rollback()
+                    if is_integrity_error(err):
+                        last_err = err
+                        continue  # retry with fresh MAX(seq)+1
+                    raise
+                finally:
+                    cur.close()
+            # Exhausted retries — propagate the last seq-collision
+            # error so the caller knows to back off (or run a
+            # single-leader recorder).
+            assert last_err is not None
+            raise last_err
 
         async with self._lock:
             await asyncio.to_thread(_run)

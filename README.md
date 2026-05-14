@@ -445,7 +445,9 @@ Why this shape:
 - **Aurora Serverless v2** uses standard wire protocol — same drivers work. (Aurora Serverless v1's HTTP Data API is the one path that *doesn't* work via DB-API — but v1 is the legacy variant.)
 - **Schema is created on first use** (`CREATE TABLE IF NOT EXISTS`). Tables: `aac_transcript_runs`, `aac_transcript_events`, `aac_conversation_messages`.
 
-Known limitation (v1): the per-id `seq` is computed as `SELECT COALESCE(MAX(seq), 0) + 1` inside a transaction. Within one process the store's `asyncio.Lock` makes this safe; **cross-process concurrent writes to the same id** are racy and may collide on the `(id, seq)` unique constraint. Workflow runs each get a unique `run_id` so this rarely bites in practice — but if you fan recorders across processes writing to one conversation, run a single leader recorder or switch to a per-id database sequence.
+Concurrency: the per-id `seq` is computed as `SELECT COALESCE(MAX(seq), 0) + 1`. Within one process the store's `asyncio.Lock` makes this safe. For **cross-process** writes against the same id, the write path now retries up to 3 times when an `IntegrityError` from a `(id, seq)` PK collision indicates another writer beat us to that seq value. This tolerates 2–3 concurrent writers cleanly; under heavier contention, run a dedicated leader recorder or switch to a per-id database sequence.
+
+For the memory store, `seq` only drives read ordering (no unique constraint). Reads include `memory_id ASC` as a deterministic tiebreak so the order is stable even when two records share a `seq` value.
 
 ### Native-async drivers (asyncpg / aiomysql)
 
