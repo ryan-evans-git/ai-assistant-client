@@ -123,6 +123,10 @@ class FileTranscriptStore:
                         payload=line.get("payload"),
                         value=line.get("value"),
                         error=line.get("error"),
+                        # Older transcripts lack ``timestamp`` —
+                        # preserve "unknown" rather than fabricating
+                        # one at read time.
+                        timestamp=line.get("timestamp", ""),
                     )
                 )
             elif kind == "footer":
