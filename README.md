@@ -580,11 +580,12 @@ for cheap `list()` reads.
 ### Agent integration
 
 `run_agent` accepts a `memory_store` + `user_id` pair; when
-**both** are set, three LLM-callable meta-tools become available
+**both** are set, four LLM-callable meta-tools become available
 to the model alongside `tool_search` / `tool_load`:
 
 * `memory_recall(tags?)` — returns the user's memories as JSON.
 * `memory_remember(key, value, tags?)` — persists a new memory.
+* `memory_update(memory_id, value)` — replaces an existing memory's value (preserves `memory_id`, `key`, `tags`, `created_at`).
 * `memory_forget(memory_id)` — deletes a memory.
 
 ```python

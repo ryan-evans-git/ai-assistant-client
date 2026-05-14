@@ -39,11 +39,12 @@ from ai_assistant_client.persistence.user_memory import Memory, MemoryStore
 # Tool-name constants the agent loop uses to route dispatch.
 MEMORY_RECALL = "memory_recall"
 MEMORY_REMEMBER = "memory_remember"
+MEMORY_UPDATE = "memory_update"
 MEMORY_FORGET = "memory_forget"
 
 
 MEMORY_META_TOOL_NAMES = frozenset(
-    {MEMORY_RECALL, MEMORY_REMEMBER, MEMORY_FORGET}
+    {MEMORY_RECALL, MEMORY_REMEMBER, MEMORY_UPDATE, MEMORY_FORGET}
 )
 
 
@@ -52,7 +53,7 @@ def is_memory_meta_tool(name: str) -> bool:
 
 
 def memory_meta_tool_schemas() -> list[dict[str, Any]]:
-    """JSON Schemas for the three memory meta-tools.
+    """JSON Schemas for the memory meta-tools.
 
     Same shape the LLM sees for any other tool — name +
     description + input_schema.  Returned in a stable order so
@@ -120,6 +121,37 @@ def memory_meta_tool_schemas() -> list[dict[str, Any]]:
             },
         },
         {
+            "name": MEMORY_UPDATE,
+            "description": (
+                "Replace the value of an existing memory by id.  "
+                "Use this when the user's stored note is wrong or "
+                "out of date — preferred over forget+remember "
+                "because it preserves the memory_id, key, tags, "
+                "and ``created_at``.  Returns the updated record."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "memory_id": {
+                        "type": "string",
+                        "description": (
+                            "The memory_id returned from "
+                            "memory_remember or memory_recall."
+                        ),
+                    },
+                    "value": {
+                        "description": (
+                            "New JSON-serializable value.  Fully "
+                            "replaces the existing value — there's "
+                            "no partial / merge semantics."
+                        ),
+                    },
+                },
+                "required": ["memory_id", "value"],
+                "additionalProperties": False,
+            },
+        },
+        {
             "name": MEMORY_FORGET,
             "description": (
                 "Delete one memory by id.  Returns a confirmation "
@@ -166,6 +198,8 @@ async def handle_memory_meta_call(
         return await _recall(store, user_id, arguments)
     if tool_name == MEMORY_REMEMBER:
         return await _remember(store, user_id, arguments)
+    if tool_name == MEMORY_UPDATE:
+        return await _update(store, user_id, arguments)
     if tool_name == MEMORY_FORGET:
         return await _forget(store, user_id, arguments)
     return f"Unknown memory tool: {tool_name}"
@@ -198,6 +232,28 @@ async def _remember(
         {"memory_id": record.memory_id, "created_at": record.created_at},
         default=str,
         ensure_ascii=False,
+    )
+
+
+async def _update(
+    store: MemoryStore, user_id: str, args: dict[str, Any]
+) -> str:
+    memory_id = args.get("memory_id")
+    if not isinstance(memory_id, str) or not memory_id.strip():
+        return "memory_update requires a 'memory_id' string."
+    if "value" not in args:
+        return "memory_update requires a 'value' field."
+    try:
+        record = await store.update(
+            user_id=user_id, memory_id=memory_id, value=args["value"]
+        )
+    except KeyError:
+        # Same anti-enumeration property as forget — wrong owner
+        # and missing-id both surface as "not found" so a
+        # probing prompt can't distinguish them.
+        return f"Memory not found: {memory_id}"
+    return json.dumps(
+        _memory_to_dict(record), default=str, ensure_ascii=False
     )
 
 

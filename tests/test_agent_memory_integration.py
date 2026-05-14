@@ -27,6 +27,7 @@ from ai_assistant_client.memory_meta import (
     MEMORY_FORGET,
     MEMORY_RECALL,
     MEMORY_REMEMBER,
+    MEMORY_UPDATE,
 )
 from ai_assistant_client.persistence import LocalMemoryStore
 
@@ -105,7 +106,12 @@ async def test_memory_tools_surfaced_only_when_both_store_and_user_id_set() -> N
 
     tools_seen = provider.tool_calls_seen[-1]
     names = {t["name"] for t in tools_seen}
-    assert {MEMORY_RECALL, MEMORY_REMEMBER, MEMORY_FORGET}.issubset(names)
+    assert {
+        MEMORY_RECALL,
+        MEMORY_REMEMBER,
+        MEMORY_UPDATE,
+        MEMORY_FORGET,
+    }.issubset(names)
 
 
 @pytest.mark.asyncio
@@ -273,3 +279,98 @@ async def test_memory_recall_only_sees_caller_user() -> None:
     recalled = json.loads(tool_results[0])
     keys = {r["key"] for r in recalled}
     assert keys == {"a"}  # bob's memory not visible
+
+
+@pytest.mark.asyncio
+async def test_llm_can_update_existing_memory() -> None:
+    """An LLM-issued ``memory_update`` lands in the right user's
+    store and the tool_result contains the updated record."""
+    store = LocalMemoryStore()
+    rec = await store.add(
+        user_id="alice", key="role", value="data scientist"
+    )
+
+    provider = _StubProvider(
+        [
+            _tool_use(
+                tool_id="tu_1",
+                tool_name=MEMORY_UPDATE,
+                tool_input_json=(
+                    '{"memory_id": "' + rec.memory_id + '", '
+                    '"value": "ML engineer"}'
+                ),
+            ),
+            _text("done"),
+        ]
+    )
+    registry = ProgressiveToolRegistry([])
+
+    async def dispatcher(name: str, arguments: dict[str, Any]) -> Any:
+        raise AssertionError("not expected")
+
+    tool_results: list[str] = []
+    async for event in run_agent(
+        user_message="update my role",
+        history=[],
+        registry=registry,
+        dispatcher=dispatcher,
+        provider=provider,
+        config=AgentRunConfig(),
+        memory_store=store,
+        user_id="alice",
+    ):
+        if event.type == "tool_result":
+            tool_results.append(event.data["content"])
+
+    payload = json.loads(tool_results[0])
+    assert payload["value"] == "ML engineer"
+    assert payload["key"] == "role"  # preserved
+
+    # Persisted in the store too.
+    again = await store.get(user_id="alice", memory_id=rec.memory_id)
+    assert again.value == "ML engineer"
+
+
+@pytest.mark.asyncio
+async def test_memory_update_cannot_cross_users_via_agent() -> None:
+    """End-to-end: even if Bob's agent run somehow knows Alice's
+    memory_id, the update is rejected with 'not found'."""
+    store = LocalMemoryStore()
+    alice_rec = await store.add(user_id="alice", key="role", value="dev")
+
+    provider = _StubProvider(
+        [
+            _tool_use(
+                tool_id="tu_1",
+                tool_name=MEMORY_UPDATE,
+                tool_input_json=(
+                    '{"memory_id": "' + alice_rec.memory_id + '", '
+                    '"value": "hacked"}'
+                ),
+            ),
+            _text("done"),
+        ]
+    )
+    registry = ProgressiveToolRegistry([])
+
+    async def dispatcher(name: str, arguments: dict[str, Any]) -> Any:
+        raise AssertionError("not expected")
+
+    tool_results: list[str] = []
+    async for event in run_agent(
+        user_message="try to update someone else's memory",
+        history=[],
+        registry=registry,
+        dispatcher=dispatcher,
+        provider=provider,
+        config=AgentRunConfig(),
+        memory_store=store,
+        user_id="bob",
+    ):
+        if event.type == "tool_result":
+            tool_results.append(event.data["content"])
+
+    assert "not found" in tool_results[0].lower()
+    # Alice's memory unchanged.
+    again = await store.get(user_id="alice", memory_id=alice_rec.memory_id)
+    assert again.value == "dev"
