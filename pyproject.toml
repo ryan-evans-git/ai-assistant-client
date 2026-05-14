@@ -36,6 +36,12 @@ bedrock = ["boto3>=1.34.0"]
 # one streaming the chat).  Single-worker dev defaults to the
 # in-memory store and doesn't need this.
 redis = ["redis>=5.0.0"]
+# Native-async DB backends for transcripts + conversations.
+# The DB-API path (no extras needed) covers the same engines via
+# psycopg / PyMySQL / etc.; these are for hosts that want to
+# avoid the ``asyncio.to_thread`` hop under high throughput.
+asyncpg = ["asyncpg>=0.29.0"]
+aiomysql = ["aiomysql>=0.2.0"]
 all = [
     "anthropic>=0.40.0",
     "openai>=1.40.0",

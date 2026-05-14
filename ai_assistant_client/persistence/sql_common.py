@@ -80,16 +80,39 @@ def adapt_sql(sql: str, dialect: Dialect) -> str:
 
     PostgreSQL drivers (``psycopg``, ``psycopg2``, ``pg8000``)
     and MySQL drivers (``PyMySQL``, ``mysqlclient``,
-    ``mysql-connector-python``) use ``%s`` as the positional
-    placeholder.  sqlite uses ``?``.
+    ``mysql-connector-python``, ``aiomysql``) use ``%s`` as the
+    positional placeholder.  sqlite uses ``?``.
 
     We intentionally don't try to be clever about strings that
     contain literal ``?`` characters — store SQL is in-tree
     constant text under our control, not user input.
+
+    For asyncpg, see :func:`adapt_sql_asyncpg` — it uses a
+    different placeholder style (``$1``, ``$2``, …).
     """
     if dialect is Dialect.SQLITE:
         return sql
     return sql.replace("?", "%s")
+
+
+def adapt_sql_asyncpg(sql: str) -> str:
+    """Rewrite ``?`` placeholders to asyncpg's ``$1``, ``$2``, … style.
+
+    asyncpg doesn't accept ``%s`` because that's a Python-side
+    formatting marker; PostgreSQL on the wire wants ``$N``
+    indexed.  We walk the SQL left-to-right and substitute each
+    ``?`` with the next ``$N`` so call sites can keep using the
+    same single placeholder marker in every adapter.
+    """
+    out: list[str] = []
+    n = 0
+    for char in sql:
+        if char == "?":
+            n += 1
+            out.append(f"${n}")
+        else:
+            out.append(char)
+    return "".join(out)
 
 
 # ---------------------------------------------------------------------------
