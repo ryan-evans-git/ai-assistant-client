@@ -475,6 +475,30 @@ Schema is byte-equivalent to what the DB-API stores create — you
 can switch between the sync and async paths against the same
 database without migrations.
 
+### Migrating an existing schema
+
+`CREATE TABLE IF NOT EXISTS` (the stores' bootstrap) doesn't
+touch existing tables when a column is added in a later release.
+For operators with pre-existing data, idempotent migration
+helpers are available:
+
+```python
+from ai_assistant_client.persistence import (
+    Dialect, ensure_transcript_events_ts_column,
+)
+
+# Run once at startup after upgrading.  Returns True if the
+# column was added, False if it was already there.
+ensure_transcript_events_ts_column(conn, dialect=Dialect.POSTGRESQL)
+```
+
+Handles all three dialects portably (sqlite uses `PRAGMA
+table_info`; PostgreSQL uses `ADD COLUMN IF NOT EXISTS`; MySQL
+swallows the duplicate-column error on a concurrent add). The
+generic helper `add_column_if_missing(conn, dialect=..., table=...,
+column=..., column_type_sql=..., default_sql=...)` covers any
+future column additions.
+
 ## Per-user memory (storage foundation)
 
 A separate `MemoryStore` protocol for durable typed notes the
