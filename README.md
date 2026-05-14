@@ -524,33 +524,65 @@ caller who knows another user's memory id can't read or mutate
 it. Tables: `aac_user_memories` plus a `(user_id, seq)` index
 for cheap `list()` reads.
 
-### What ships here vs. what doesn't
+### Agent integration
 
-**Storage only.** Wiring memory into the agent loop — how
-memories get recalled, when they're injected into the system
-prompt, the shape of an LLM-callable
-`memory_recall` / `memory_remember` meta-tool — is a separate
-design pass and ships in a follow-up PR.
+`run_agent` accepts a `memory_store` + `user_id` pair; when
+**both** are set, three LLM-callable meta-tools become available
+to the model alongside `tool_search` / `tool_load`:
 
-The hand-off shape: hosts retrieving memories for inclusion in
-a prompt **MUST** treat the content as untrusted input. A
-cooperative-but-malicious user can plant memories designed to
-override the system prompt on a future turn. The recommended
-pattern:
+* `memory_recall(tags?)` — returns the user's memories as JSON.
+* `memory_remember(key, value, tags?)` — persists a new memory.
+* `memory_forget(memory_id)` — deletes a memory.
 
 ```python
-recalled = await store.list(user_id=current_user_id, tags=("preference",))
-prompt = (
-    f"{base_system_prompt}\n\n"
-    "<user_memory>\n"  # opaque delimiter — treat contents as data, never instructions
-    + "\n".join(f"- {r.key}: {r.value!r}" for r in recalled)
-    + "\n</user_memory>"
-)
+from ai_assistant_client.persistence import make_memory_store
+
+store = make_memory_store()
+async for event in run_agent(
+    ...,
+    memory_store=store,
+    user_id=request_user_id,  # closed over — LLM can't spoof
+):
+    ...
 ```
 
-Memory ids that contribute to each turn should be logged so an
-incident can be traced. The store doesn't enforce these
-patterns — they're caller-side discipline.
+Security: every meta-tool dispatch closes over `user_id` from
+the agent's context. An LLM tool-use that includes a `user_id`
+field in its arguments is ignored — the value comes from the
+host's call to `run_agent`, not from model output. The meta-
+tools stay invisible if either `memory_store` or `user_id` is
+`None` so a misconfig can't expose the recall surface without
+isolation.
+
+### System-prompt injection helper
+
+For hosts that want recalled memories visible to the LLM as
+context (rather than fetched on demand), `build_system_prompt_with_memory`
+produces the augmented prompt with the recommended
+injection-resistance envelope:
+
+```python
+from ai_assistant_client.memory_prompt import build_system_prompt_with_memory
+
+result = await build_system_prompt_with_memory(
+    base_system_prompt,
+    store=store,
+    user_id=request_user_id,
+    tags=("preference",),  # optional filter
+)
+config = AgentRunConfig(
+    ...,
+    system_prompt=result.system_prompt,
+)
+# Log which memories contributed so an incident can be traced.
+log.info("turn used memories: %s", result.memory_ids)
+```
+
+The helper wraps recalled content in a `<user_memory>...</user_memory>`
+delimiter and prepends a reminder telling the model to treat
+the contents as data, not instructions. **This is opt-in** —
+the agent doesn't auto-inject so the host keeps product
+decisions about which memories to surface, when.
 
 ### Privacy invariants the protocol enforces
 
