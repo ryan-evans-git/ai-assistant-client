@@ -498,8 +498,31 @@ await store.forget_all(user_id="alice")  # GDPR-style erasure
 
 | Env var | Values | Notes |
 |---|---|---|
-| `AAC_MEMORY_BACKEND` | `local` *(default)* / `file` | SQL / async backends planned as follow-ups; same protocol. |
+| `AAC_MEMORY_BACKEND` | `local` *(default)* / `file` / `sqlite` | Postgres / MySQL / Aurora use `SqlMemoryStore` / `AsyncpgMemoryStore` / `AiomysqlMemoryStore` with a caller-built connection. |
 | `AAC_MEMORY_DIR` | path | Base directory for the `file` backend; defaults to `./memories`. One `.jsonl` file per user id. |
+| `AAC_MEMORY_SQLITE_PATH` | path | Path to the sqlite file for the `sqlite` backend; defaults to `./memories.sqlite3`. |
+
+```python
+import psycopg
+from ai_assistant_client.persistence import (
+    Dialect, SqlMemoryStore, AsyncpgMemoryStore,
+)
+
+# DB-API 2.0 — sqlite / Postgres / MySQL / Aurora via any compliant driver.
+conn = psycopg.connect("postgresql://...")
+store = SqlMemoryStore(conn, dialect=Dialect.POSTGRESQL)
+
+# Or native-async for high-throughput Aurora PG / MySQL.
+import asyncpg
+pool = await asyncpg.create_pool("postgresql://...")
+store = AsyncpgMemoryStore(pool)
+```
+
+The SQL stores enforce per-user isolation at the SQL level
+(`WHERE memory_id = ? AND user_id = ?` on every operation) — a
+caller who knows another user's memory id can't read or mutate
+it. Tables: `aac_user_memories` plus a `(user_id, seq)` index
+for cheap `list()` reads.
 
 ### What ships here vs. what doesn't
 

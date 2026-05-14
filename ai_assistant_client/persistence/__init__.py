@@ -43,6 +43,7 @@ from ai_assistant_client.persistence.factory import (
     CONVERSATION_SQLITE_PATH_ENV,
     MEMORY_BACKEND_ENV,
     MEMORY_DIR_ENV,
+    MEMORY_SQLITE_PATH_ENV,
     TRANSCRIPT_BACKEND_ENV,
     TRANSCRIPT_DIR_ENV,
     TRANSCRIPT_SQLITE_PATH_ENV,
@@ -55,11 +56,17 @@ from ai_assistant_client.persistence.memory import InMemoryTranscriptStore
 from ai_assistant_client.persistence.aiomysql_conversation import (
     AiomysqlConversationStore,
 )
+from ai_assistant_client.persistence.aiomysql_memory import (
+    AiomysqlMemoryStore,
+)
 from ai_assistant_client.persistence.aiomysql_transcript import (
     AiomysqlTranscriptStore,
 )
 from ai_assistant_client.persistence.asyncpg_conversation import (
     AsyncpgConversationStore,
+)
+from ai_assistant_client.persistence.asyncpg_memory import (
+    AsyncpgMemoryStore,
 )
 from ai_assistant_client.persistence.asyncpg_transcript import (
     AsyncpgTranscriptStore,
@@ -68,6 +75,7 @@ from ai_assistant_client.persistence.sql_common import Dialect
 from ai_assistant_client.persistence.sql_conversation import (
     SqlConversationStore,
 )
+from ai_assistant_client.persistence.sql_memory import SqlMemoryStore
 from ai_assistant_client.persistence.sql_transcript import SqlTranscriptStore
 from ai_assistant_client.persistence.transcript import (
     RunFooter,
@@ -82,8 +90,10 @@ from ai_assistant_client.persistence.user_memory_local import LocalMemoryStore
 
 __all__ = [
     "AiomysqlConversationStore",
+    "AiomysqlMemoryStore",
     "AiomysqlTranscriptStore",
     "AsyncpgConversationStore",
+    "AsyncpgMemoryStore",
     "AsyncpgTranscriptStore",
     "CONVERSATION_BACKEND_ENV",
     "CONVERSATION_DIR_ENV",
@@ -98,6 +108,7 @@ __all__ = [
     "LocalMemoryStore",
     "MEMORY_BACKEND_ENV",
     "MEMORY_DIR_ENV",
+    "MEMORY_SQLITE_PATH_ENV",
     "Memory",
     "MemoryStore",
     "Message",
@@ -105,6 +116,7 @@ __all__ = [
     "RunHeader",
     "RunTranscript",
     "SqlConversationStore",
+    "SqlMemoryStore",
     "SqlTranscriptStore",
     "TRANSCRIPT_BACKEND_ENV",
     "TRANSCRIPT_DIR_ENV",

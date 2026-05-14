@@ -209,6 +209,67 @@ _TRANSCRIPT_EVENTS_DDL: dict[Dialect, str] = {
 }
 
 
+_MEMORY_DDL: dict[Dialect, str] = {
+    Dialect.SQLITE: """
+        CREATE TABLE IF NOT EXISTS aac_user_memories (
+            memory_id    TEXT PRIMARY KEY,
+            user_id      TEXT NOT NULL,
+            mkey         TEXT NOT NULL,
+            value_json   TEXT NOT NULL,
+            tags_json    TEXT NOT NULL DEFAULT '[]',
+            created_at   TEXT NOT NULL,
+            updated_at   TEXT NOT NULL,
+            seq          INTEGER NOT NULL
+        )
+    """,
+    Dialect.POSTGRESQL: """
+        CREATE TABLE IF NOT EXISTS aac_user_memories (
+            memory_id    TEXT PRIMARY KEY,
+            user_id      TEXT NOT NULL,
+            mkey         TEXT NOT NULL,
+            value_json   TEXT NOT NULL,
+            tags_json    TEXT NOT NULL DEFAULT '[]',
+            created_at   TEXT NOT NULL,
+            updated_at   TEXT NOT NULL,
+            seq          BIGINT NOT NULL
+        )
+    """,
+    Dialect.MYSQL: """
+        CREATE TABLE IF NOT EXISTS aac_user_memories (
+            memory_id    VARCHAR(64) PRIMARY KEY,
+            user_id      VARCHAR(255) NOT NULL,
+            mkey         VARCHAR(255) NOT NULL,
+            value_json   MEDIUMTEXT NOT NULL,
+            tags_json    MEDIUMTEXT NOT NULL,
+            created_at   VARCHAR(64) NOT NULL,
+            updated_at   VARCHAR(64) NOT NULL,
+            seq          BIGINT NOT NULL
+        )
+    """,
+}
+
+
+_MEMORY_INDEX_DDL: dict[Dialect, str] = {
+    # Cheap user-scoped reads (``list(user_id=...)``) without
+    # forcing a full-table scan.  ``CREATE INDEX IF NOT EXISTS``
+    # is portable across sqlite + Postgres + MySQL 8+; older
+    # MySQLs need a try/except.  We stash the seq column in the
+    # index so list() can ORDER BY seq cheaply.
+    Dialect.SQLITE: """
+        CREATE INDEX IF NOT EXISTS aac_user_memories_by_user
+        ON aac_user_memories (user_id, seq)
+    """,
+    Dialect.POSTGRESQL: """
+        CREATE INDEX IF NOT EXISTS aac_user_memories_by_user
+        ON aac_user_memories (user_id, seq)
+    """,
+    Dialect.MYSQL: """
+        CREATE INDEX aac_user_memories_by_user
+        ON aac_user_memories (user_id, seq)
+    """,
+}
+
+
 _CONVERSATION_MESSAGES_DDL: dict[Dialect, str] = {
     Dialect.SQLITE: """
         CREATE TABLE IF NOT EXISTS aac_conversation_messages (
@@ -247,6 +308,22 @@ def transcript_events_ddl(dialect: Dialect) -> str:
 
 def conversation_messages_ddl(dialect: Dialect) -> str:
     return _CONVERSATION_MESSAGES_DDL[dialect]
+
+
+def memory_ddl(dialect: Dialect) -> str:
+    return _MEMORY_DDL[dialect]
+
+
+def memory_index_ddl(dialect: Dialect) -> str:
+    """User-scoped index for cheap ``list(user_id=...)`` reads.
+
+    MySQL doesn't support ``CREATE INDEX IF NOT EXISTS`` until
+    very recent versions, so callers should swallow
+    "duplicate key" errors at create time when the dialect is
+    :attr:`Dialect.MYSQL` — see :meth:`SqlMemoryStore._ensure_schema`
+    for the pattern.
+    """
+    return _MEMORY_INDEX_DDL[dialect]
 
 
 # ---------------------------------------------------------------------------
