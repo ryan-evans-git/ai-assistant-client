@@ -31,13 +31,14 @@ without caring how the run was originally captured.
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Iterable, Literal
 
 from ai_assistant_client.persistence.transcript import RunTranscript
 from ai_assistant_client.workflows.runtime import WorkflowEvent
 
 
-DiagramKind = Literal["flowchart", "sequence"]
+DiagramKind = Literal["flowchart", "sequence", "gantt"]
 
 
 def transcript_to_mermaid(
@@ -54,6 +55,8 @@ def transcript_to_mermaid(
         return _render_flowchart(transcript)
     if kind == "sequence":
         return _render_sequence(transcript)
+    if kind == "gantt":
+        return _render_gantt(transcript)
     raise ValueError(f"unknown diagram kind {kind!r}")
 
 
@@ -230,6 +233,146 @@ def _sequence_lines(event: WorkflowEvent) -> Iterable[str]:
 # ---------------------------------------------------------------------------
 # Escaping
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Gantt timing diagram
+# ---------------------------------------------------------------------------
+
+
+def _render_gantt(transcript: RunTranscript) -> str:
+    """Render the run as a Mermaid Gantt chart.
+
+    One task per event, positioned by its ``timestamp`` and
+    sized to the gap between consecutive events.  Sections
+    separate confirmation pauses from active workflow time so a
+    reader can see at a glance how much wall time was spent
+    waiting on user input vs. doing work.
+
+    Requires events to have ISO-8601 timestamps (added in the
+    per-event-timestamps PR).  Events missing a timestamp are
+    skipped — a partial / pre-timestamp transcript renders the
+    events it has data for; if no events have timestamps the
+    output is just the title + axis line so callers can detect
+    the empty case.
+    """
+    title = (
+        f"Workflow {transcript.header.workflow_name}"
+        if transcript.header.workflow_name
+        else "Workflow run"
+    )
+    lines: list[str] = [
+        "gantt",
+        f"    title {_escape(title)}",
+        # Use ISO-8601 since that's what WorkflowEvent.timestamp
+        # emits; Mermaid's Gantt accepts it directly.
+        "    dateFormat YYYY-MM-DDTHH:mm:ss.SSSXXX",
+        "    axisFormat %H:%M:%S",
+    ]
+
+    # Parse all events with usable timestamps in order.
+    stamped: list[tuple[WorkflowEvent, datetime]] = []
+    for event in transcript.events:
+        ts = _parse_iso(event.timestamp)
+        if ts is not None:
+            stamped.append((event, ts))
+
+    if not stamped:
+        return "\n".join(lines)
+
+    # Use the header's started_at when available so the chart's
+    # first bar is anchored at the run start rather than the
+    # first event (status events fire after a tick or two).
+    run_start = _parse_iso(transcript.header.started_at) or stamped[0][1]
+    # Footer ends the chart bound; fall back to the last event.
+    run_end_str = transcript.footer.ended_at if transcript.footer else None
+    run_end = _parse_iso(run_end_str) if run_end_str else None
+    if run_end is None:
+        run_end = stamped[-1][1]
+
+    # Each event becomes a task that spans from its timestamp
+    # to the next event's timestamp.  The last event runs until
+    # the footer / last-known time so the bar is visible rather
+    # than zero-width.
+    section_seen: set[str] = set()
+    for i, (event, ts) in enumerate(stamped):
+        section = _section_for(event.type)
+        if section not in section_seen:
+            lines.append(f"    section {_escape(section)}")
+            section_seen.add(section)
+
+        next_ts = stamped[i + 1][1] if i + 1 < len(stamped) else run_end
+        # Mermaid Gantt requires a non-zero duration; clamp very
+        # short gaps to 1ms so the bar still renders.
+        if next_ts <= ts:
+            next_ts = ts + (run_end - run_start) / max(1, len(stamped) * 10)
+
+        task_id = f"e{i}"
+        label = _gantt_label(event)
+        start_iso = _to_mermaid_iso(ts)
+        end_iso = _to_mermaid_iso(next_ts)
+        lines.append(
+            f"    {_escape(label)} :{task_id}, {start_iso}, {end_iso}"
+        )
+
+    return "\n".join(lines)
+
+
+def _section_for(event_type: str) -> str:
+    """Group event types into Gantt sections.
+
+    Confirmation request + resolved together so a reader can
+    see the pause as one block.  Result / error get their own
+    section so the terminal step stands out.
+    """
+    if event_type in ("confirmation_request", "confirmation_resolved"):
+        return "Confirmation"
+    if event_type in ("result", "error"):
+        return "Outcome"
+    return "Active"
+
+
+def _gantt_label(event: WorkflowEvent) -> str:
+    """Compact label for a Gantt task.
+
+    Mermaid Gantt task names appear *to the left of* the bar;
+    keep them short so they don't overflow the legend column.
+    """
+    if event.type == "status":
+        return _payload_message(event)[:40]
+    if event.type == "confirmation_request":
+        return f"confirm? {_confirmation_message(event)[:30]}"
+    if event.type == "confirmation_resolved":
+        decision = (event.payload or {}).get("decision", "?")
+        return f"resolved: {decision}"
+    if event.type == "result":
+        return "result"
+    if event.type == "error":
+        return "error"
+    return event.type
+
+
+def _parse_iso(value: str | None) -> datetime | None:
+    """Parse an ISO-8601 string into a tz-aware ``datetime``.
+
+    Returns ``None`` for empty / malformed inputs — used by the
+    Gantt renderer to filter events with unknown timestamps
+    rather than crashing the whole render.
+    """
+    if not value:
+        return None
+    try:
+        # ``datetime.fromisoformat`` accepts the ISO-8601 strings
+        # the workflow runtime emits (incl. ``+00:00`` offsets).
+        return datetime.fromisoformat(value)
+    except (ValueError, TypeError):
+        return None
+
+
+def _to_mermaid_iso(value: datetime) -> str:
+    """Format a datetime back to the ISO-8601 form Mermaid's
+    Gantt dateFormat expects (``YYYY-MM-DDTHH:mm:ss.SSSXXX``)."""
+    return value.isoformat()
 
 
 def _escape(text: str) -> str:

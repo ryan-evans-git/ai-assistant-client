@@ -234,7 +234,7 @@ def test_sequence_no_footer_no_note() -> None:
 
 def test_unknown_kind_raises_value_error() -> None:
     with pytest.raises(ValueError, match="unknown diagram kind"):
-        transcript_to_mermaid(_transcript([]), kind="gantt")  # type: ignore[arg-type]
+        transcript_to_mermaid(_transcript([]), kind="pie-chart")  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------
