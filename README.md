@@ -530,6 +530,23 @@ later = await store.list(user_id="alice", tags=("work",))
 await store.forget_all(user_id="alice")  # GDPR-style erasure
 ```
 
+For the `file` backend specifically, `compact(user_id=...)`
+rewrites the append-only log so only live records remain —
+useful after many turns of updates / removes have inflated the
+on-disk file. Atomic via tempfile-then-`os.replace` so a crash
+mid-compaction leaves the original log intact:
+
+```python
+stats = await store.compact(user_id="alice")
+log.info(
+    "compacted alice's log: %d → %d lines (%d bytes saved)",
+    stats.before_lines, stats.after_lines, stats.bytes_saved,
+)
+```
+
+No-op when the log is already compact (`bytes_saved == 0`) so a
+scheduler can call it on every user without first checking.
+
 | Env var | Values | Notes |
 |---|---|---|
 | `AAC_MEMORY_BACKEND` | `local` *(default)* / `file` / `sqlite` | Postgres / MySQL / Aurora use `SqlMemoryStore` / `AsyncpgMemoryStore` / `AiomysqlMemoryStore` with a caller-built connection. |
