@@ -328,7 +328,32 @@ events + outcome). It does **not** mock tool calls inside the
 handler — for that, write the workflow to inject its tool
 dependencies and pass mocks at test time.
 
-### Visualize a recorded run
+### Recording, replay, and graph viz from the CLI
+
+Set `AAC_WORKFLOW_RECORDING=on` and every workflow the agent
+dispatches gets recorded into whichever transcript backend
+you've configured. Then inspect runs offline with the
+sub-commands:
+
+```bash
+# Run the server with recording on.
+AAC_WORKFLOW_RECORDING=on \
+AAC_TRANSCRIPT_BACKEND=sqlite \
+AAC_TRANSCRIPT_SQLITE_PATH=./transcripts.sqlite3 \
+ai-assistant-client
+
+# In another shell: list / replay / draw a recorded run.
+ai-assistant-client replay wf_send_email_abc123           # JSON lines on stdout
+ai-assistant-client graph wf_send_email_abc123             # Mermaid flowchart
+ai-assistant-client graph wf_send_email_abc123 --kind sequence
+```
+
+Both sub-commands read the same env vars the server writes
+with, so a run recorded on one process is immediately
+inspectable from another. Unknown run ids exit non-zero so a
+shell pipeline can fail loudly.
+
+### Visualize a recorded run programmatically
 
 Any `RunTranscript` (in-memory, file, or SQL backend) renders to
 a Mermaid diagram — useful for embedding in PR descriptions,
