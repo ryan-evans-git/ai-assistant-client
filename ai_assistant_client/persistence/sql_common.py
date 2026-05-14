@@ -95,6 +95,40 @@ def adapt_sql(sql: str, dialect: Dialect) -> str:
     return sql.replace("?", "%s")
 
 
+# ---------------------------------------------------------------------------
+# Concurrency helpers
+# ---------------------------------------------------------------------------
+
+
+# How many times the seq-collision retry loop will re-spin before
+# giving up.  The collision is the cross-process race documented
+# on each ``append_event`` / ``append`` site: two processes both
+# compute MAX(seq)+1 and the second INSERT fails on the PK.
+# Three attempts means up to ``log2(3) ≈ 1.6`` concurrent writers
+# can be tolerated cleanly; for very high fan-out a host should
+# still run a single leader recorder.
+SEQ_COLLISION_MAX_ATTEMPTS = 3
+
+
+def is_integrity_error(err: Exception) -> bool:
+    """Best-effort detection of DB-API IntegrityError without
+    importing each driver at module load.
+
+    DB-API 2.0 defines ``IntegrityError`` as a module-level
+    exception class on every compliant driver, but the actual
+    class lives on each driver module and is not uniformly
+    inheritable.  Walk the MRO looking for a class named
+    literally ``IntegrityError`` — that catches sqlite,
+    psycopg/psycopg2, PyMySQL, mysqlclient, asyncpg (via
+    its ``UniqueViolationError`` subclass), and aiomysql
+    (which re-exports PyMySQL's).
+    """
+    for cls in type(err).__mro__:
+        if cls.__name__ in ("IntegrityError", "UniqueViolationError"):
+            return True
+    return False
+
+
 def adapt_sql_asyncpg(sql: str) -> str:
     """Rewrite ``?`` placeholders to asyncpg's ``$1``, ``$2``, … style.
 

@@ -22,9 +22,11 @@ from __future__ import annotations
 from typing import Any
 
 from ai_assistant_client.persistence.sql_common import (
+    SEQ_COLLISION_MAX_ATTEMPTS,
     Dialect,
     adapt_sql,
     from_json,
+    is_integrity_error,
     to_json,
     transcript_events_ddl,
     transcript_runs_ddl,
@@ -109,27 +111,46 @@ class AiomysqlTranscriptStore:
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
             Dialect.MYSQL,
         )
-        async with self._pool.acquire() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute(check_sql, (run_id,))
-                if await cur.fetchone() is None:
-                    raise KeyError(run_id)
-                await cur.execute(next_seq_sql, (run_id,))
-                row = await cur.fetchone()
-                next_seq = int(row[0]) if row and row[0] is not None else 1
-                await cur.execute(
-                    insert_sql,
-                    (
-                        run_id,
-                        next_seq,
-                        event.type,
-                        to_json(event.payload) if event.payload is not None else None,
-                        to_json(event.value) if event.value is not None else None,
-                        event.error,
-                        event.timestamp,
-                    ),
-                )
-            await conn.commit()
+        # Cross-process seq-collision retry — see
+        # SqlTranscriptStore.append_event for the full rationale.
+        last_err: Exception | None = None
+        for _attempt in range(SEQ_COLLISION_MAX_ATTEMPTS):
+            try:
+                async with self._pool.acquire() as conn:
+                    async with conn.cursor() as cur:
+                        await cur.execute(check_sql, (run_id,))
+                        if await cur.fetchone() is None:
+                            raise KeyError(run_id)
+                        await cur.execute(next_seq_sql, (run_id,))
+                        row = await cur.fetchone()
+                        next_seq = (
+                            int(row[0])
+                            if row and row[0] is not None
+                            else 1
+                        )
+                        await cur.execute(
+                            insert_sql,
+                            (
+                                run_id,
+                                next_seq,
+                                event.type,
+                                to_json(event.payload) if event.payload is not None else None,
+                                to_json(event.value) if event.value is not None else None,
+                                event.error,
+                                event.timestamp,
+                            ),
+                        )
+                    await conn.commit()
+                return
+            except KeyError:
+                raise
+            except Exception as err:
+                if is_integrity_error(err):
+                    last_err = err
+                    continue
+                raise
+        assert last_err is not None
+        raise last_err
 
     async def write_footer(self, run_id: str, footer: RunFooter) -> None:
         await self._ensure_schema()
