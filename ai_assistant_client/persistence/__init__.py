@@ -41,10 +41,13 @@ from ai_assistant_client.persistence.factory import (
     CONVERSATION_BACKEND_ENV,
     CONVERSATION_DIR_ENV,
     CONVERSATION_SQLITE_PATH_ENV,
+    MEMORY_BACKEND_ENV,
+    MEMORY_DIR_ENV,
     TRANSCRIPT_BACKEND_ENV,
     TRANSCRIPT_DIR_ENV,
     TRANSCRIPT_SQLITE_PATH_ENV,
     make_conversation_store,
+    make_memory_store,
     make_transcript_store,
 )
 from ai_assistant_client.persistence.file import FileTranscriptStore
@@ -72,6 +75,9 @@ from ai_assistant_client.persistence.transcript import (
     RunTranscript,
     TranscriptStore,
 )
+from ai_assistant_client.persistence.user_memory import Memory, MemoryStore
+from ai_assistant_client.persistence.user_memory_file import FileMemoryStore
+from ai_assistant_client.persistence.user_memory_local import LocalMemoryStore
 
 
 __all__ = [
@@ -85,9 +91,15 @@ __all__ = [
     "ConversationStore",
     "Dialect",
     "FileConversationStore",
+    "FileMemoryStore",
     "FileTranscriptStore",
     "InMemoryConversationStore",
     "InMemoryTranscriptStore",
+    "LocalMemoryStore",
+    "MEMORY_BACKEND_ENV",
+    "MEMORY_DIR_ENV",
+    "Memory",
+    "MemoryStore",
     "Message",
     "RunFooter",
     "RunHeader",
@@ -99,5 +111,6 @@ __all__ = [
     "TRANSCRIPT_SQLITE_PATH_ENV",
     "TranscriptStore",
     "make_conversation_store",
+    "make_memory_store",
     "make_transcript_store",
 ]

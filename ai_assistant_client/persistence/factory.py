@@ -49,6 +49,9 @@ from ai_assistant_client.persistence.sql_conversation import (
 )
 from ai_assistant_client.persistence.sql_transcript import SqlTranscriptStore
 from ai_assistant_client.persistence.transcript import TranscriptStore
+from ai_assistant_client.persistence.user_memory import MemoryStore
+from ai_assistant_client.persistence.user_memory_file import FileMemoryStore
+from ai_assistant_client.persistence.user_memory_local import LocalMemoryStore
 
 
 TRANSCRIPT_BACKEND_ENV = "AAC_TRANSCRIPT_BACKEND"
@@ -59,10 +62,14 @@ CONVERSATION_BACKEND_ENV = "AAC_CONVERSATION_BACKEND"
 CONVERSATION_DIR_ENV = "AAC_CONVERSATION_DIR"
 CONVERSATION_SQLITE_PATH_ENV = "AAC_CONVERSATION_SQLITE_PATH"
 
+MEMORY_BACKEND_ENV = "AAC_MEMORY_BACKEND"
+MEMORY_DIR_ENV = "AAC_MEMORY_DIR"
+
 _DEFAULT_TRANSCRIPT_DIR = "./transcripts"
 _DEFAULT_CONVERSATION_DIR = "./conversations"
 _DEFAULT_TRANSCRIPT_SQLITE_PATH = "./transcripts.sqlite3"
 _DEFAULT_CONVERSATION_SQLITE_PATH = "./conversations.sqlite3"
+_DEFAULT_MEMORY_DIR = "./memories"
 
 
 def make_transcript_store(
@@ -129,6 +136,38 @@ def make_conversation_store(
     raise ValueError(
         f"unknown conversation backend {resolved!r} — expected one of: "
         "memory, file, sqlite"
+    )
+
+
+def make_memory_store(
+    *, kind: str | None = None, base_dir: str | None = None
+) -> MemoryStore:
+    """Construct a per-user memory store from env vars (or args).
+
+    ``kind`` overrides ``AAC_MEMORY_BACKEND``; ``base_dir``
+    overrides ``AAC_MEMORY_DIR`` (file backend).  Same fail-loud
+    rule for unknown backends.
+
+    Per-user memory is a separate axis from transcripts /
+    conversations because the privacy + injection-resistance
+    surface is materially different — the host might cache
+    transcripts on disk in dev but always persist memory to a
+    cloud DB with retention policy in prod.  Independent env
+    vars keep those choices independent.
+    """
+    resolved = (
+        kind or os.environ.get(MEMORY_BACKEND_ENV) or "local"
+    ).lower()
+    if resolved == "local":
+        return LocalMemoryStore()
+    if resolved == "file":
+        directory = base_dir or os.environ.get(
+            MEMORY_DIR_ENV, _DEFAULT_MEMORY_DIR
+        )
+        return FileMemoryStore(directory)
+    raise ValueError(
+        f"unknown memory backend {resolved!r} — expected one of: "
+        "local, file"
     )
 
 
