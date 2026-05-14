@@ -437,6 +437,44 @@ Why this shape:
 
 Known limitation (v1): the per-id `seq` is computed as `SELECT COALESCE(MAX(seq), 0) + 1` inside a transaction. Within one process the store's `asyncio.Lock` makes this safe; **cross-process concurrent writes to the same id** are racy and may collide on the `(id, seq)` unique constraint. Workflow runs each get a unique `run_id` so this rarely bites in practice — but if you fan recorders across processes writing to one conversation, run a single leader recorder or switch to a per-id database sequence.
 
+### Native-async drivers (asyncpg / aiomysql)
+
+The DB-API path covers every supported engine via a worker
+thread (`asyncio.to_thread`). For hosts that want to avoid that
+hop under high recording throughput, drop-in native-async
+implementations are available:
+
+```bash
+pip install "ai-assistant-client[asyncpg]"   # PostgreSQL incl. Aurora PG
+pip install "ai-assistant-client[aiomysql]"  # MySQL incl. Aurora MySQL
+```
+
+```python
+import asyncpg
+from ai_assistant_client.persistence import (
+    AsyncpgTranscriptStore, AsyncpgConversationStore,
+)
+
+pool = await asyncpg.create_pool("postgresql://...")
+transcripts = AsyncpgTranscriptStore(pool)
+conversations = AsyncpgConversationStore(pool)
+```
+
+```python
+import aiomysql
+from ai_assistant_client.persistence import (
+    AiomysqlTranscriptStore, AiomysqlConversationStore,
+)
+
+pool = await aiomysql.create_pool(host=..., user=..., password=..., db=...)
+transcripts = AiomysqlTranscriptStore(pool)
+conversations = AiomysqlConversationStore(pool)
+```
+
+Schema is byte-equivalent to what the DB-API stores create — you
+can switch between the sync and async paths against the same
+database without migrations.
+
 ## Visuals (charts, tables, KPI tiles, images)
 
 The model can render structured visuals in the host UI by calling the

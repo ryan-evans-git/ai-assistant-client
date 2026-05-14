@@ -49,6 +49,18 @@ from ai_assistant_client.persistence.factory import (
 )
 from ai_assistant_client.persistence.file import FileTranscriptStore
 from ai_assistant_client.persistence.memory import InMemoryTranscriptStore
+from ai_assistant_client.persistence.aiomysql_conversation import (
+    AiomysqlConversationStore,
+)
+from ai_assistant_client.persistence.aiomysql_transcript import (
+    AiomysqlTranscriptStore,
+)
+from ai_assistant_client.persistence.asyncpg_conversation import (
+    AsyncpgConversationStore,
+)
+from ai_assistant_client.persistence.asyncpg_transcript import (
+    AsyncpgTranscriptStore,
+)
 from ai_assistant_client.persistence.sql_common import Dialect
 from ai_assistant_client.persistence.sql_conversation import (
     SqlConversationStore,
@@ -63,6 +75,10 @@ from ai_assistant_client.persistence.transcript import (
 
 
 __all__ = [
+    "AiomysqlConversationStore",
+    "AiomysqlTranscriptStore",
+    "AsyncpgConversationStore",
+    "AsyncpgTranscriptStore",
     "CONVERSATION_BACKEND_ENV",
     "CONVERSATION_DIR_ENV",
     "CONVERSATION_SQLITE_PATH_ENV",
