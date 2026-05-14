@@ -26,10 +26,12 @@ from ai_assistant_client.persistence.conversation import (
     Message,
 )
 from ai_assistant_client.persistence.sql_common import (
+    SEQ_COLLISION_MAX_ATTEMPTS,
     Dialect,
     adapt_sql,
     conversation_messages_ddl,
     from_json,
+    is_integrity_error,
     to_json,
 )
 
@@ -73,20 +75,32 @@ class SqlConversationStore(ConversationStore):
         encoded = to_json(message)
 
         def _run() -> None:
-            cur = self._conn.cursor()
-            try:
-                cur.execute(next_seq_sql, (conversation_id,))
-                row = cur.fetchone()
-                next_seq = int(row[0]) if row and row[0] is not None else 1
-                cur.execute(
-                    insert_sql, (conversation_id, next_seq, encoded)
-                )
-                self._conn.commit()
-            except Exception:
-                self._conn.rollback()
-                raise
-            finally:
-                cur.close()
+            # Same SELECT-MAX(seq)+INSERT retry loop as
+            # SqlTranscriptStore.append_event — handles the cross-
+            # process race where two writers compute the same
+            # ``seq`` between SELECT and INSERT.
+            last_err: Exception | None = None
+            for _attempt in range(SEQ_COLLISION_MAX_ATTEMPTS):
+                cur = self._conn.cursor()
+                try:
+                    cur.execute(next_seq_sql, (conversation_id,))
+                    row = cur.fetchone()
+                    next_seq = int(row[0]) if row and row[0] is not None else 1
+                    cur.execute(
+                        insert_sql, (conversation_id, next_seq, encoded)
+                    )
+                    self._conn.commit()
+                    return
+                except Exception as err:
+                    self._conn.rollback()
+                    if is_integrity_error(err):
+                        last_err = err
+                        continue
+                    raise
+                finally:
+                    cur.close()
+            assert last_err is not None
+            raise last_err
 
         async with self._lock:
             await asyncio.to_thread(_run)
