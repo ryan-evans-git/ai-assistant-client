@@ -363,15 +363,25 @@ runbooks, or static documentation:
 from ai_assistant_client.workflows.graph import transcript_to_mermaid
 
 transcript = await store.read("run-2026-05-14-...")
-print(transcript_to_mermaid(transcript))               # flowchart (default)
+print(transcript_to_mermaid(transcript))                # flowchart (default)
 print(transcript_to_mermaid(transcript, kind="sequence"))
+print(transcript_to_mermaid(transcript, kind="gantt"))  # timing chart
 ```
 
 The output is a self-contained Mermaid block — wrap it in
 ` ```mermaid … ``` ` fences and GitHub / GitLab / Notion will
 render it natively. Confirmation pauses become decision
-diamonds; `result` and `error` terminal nodes carry style
-classes so successes and failures are visually distinct.
+diamonds in the flowchart; `result` and `error` terminal nodes
+carry style classes so successes and failures are visually
+distinct.
+
+The **Gantt** variant uses the per-event timestamps to show
+when each step happened and how long the wait between events
+was — useful for latency analysis and for visualising how much
+wall time a run spent paused on user confirmation vs. doing
+work. Events without timestamps (pre-timestamp recordings) are
+skipped; if no events have timestamps the chart renders just
+the skeleton so the caller can detect the empty case.
 
 ## Conversation history persistence
 
