@@ -314,8 +314,9 @@ Pick the backend by env var:
 
 | Env var | Values | Notes |
 |---|---|---|
-| `AAC_TRANSCRIPT_BACKEND` | `memory` *(default)* / `file` | More backends (managed cloud DBs, OLTP) plug in later under the same protocol. |
+| `AAC_TRANSCRIPT_BACKEND` | `memory` *(default)* / `file` / `sqlite` | Postgres / MySQL / Aurora use `SqlTranscriptStore` with a caller-built connection — see [SQL backends](#sql-backends-aurora-postgres-mysql-rds) below. |
 | `AAC_TRANSCRIPT_DIR` | path | Base directory for the `file` backend; defaults to `./transcripts`. One `.jsonl` file per run id. |
+| `AAC_TRANSCRIPT_SQLITE_PATH` | path | Path to the sqlite file for the `sqlite` backend; defaults to `./transcripts.sqlite3`. |
 
 A parallel `ConversationStore` (below) handles open-ended chat
 history. Adding a new backend (SQL on a local sqlite, SQL on a
@@ -360,8 +361,36 @@ store:
 
 | Env var | Values | Notes |
 |---|---|---|
-| `AAC_CONVERSATION_BACKEND` | `memory` *(default)* / `file` | More backends (SQL on local sqlite, managed cloud DBs, OLTP) plug in later under the same protocol. |
+| `AAC_CONVERSATION_BACKEND` | `memory` *(default)* / `file` / `sqlite` | Postgres / MySQL / Aurora use `SqlConversationStore` with a caller-built connection — see [SQL backends](#sql-backends-aurora-postgres-mysql-rds) below. |
 | `AAC_CONVERSATION_DIR` | path | Base directory for the `file` backend; defaults to `./conversations`. One `.jsonl` file per conversation id. |
+| `AAC_CONVERSATION_SQLITE_PATH` | path | Path to the sqlite file for the `sqlite` backend; defaults to `./conversations.sqlite3`. |
+
+## SQL backends (Aurora, Postgres, MySQL, RDS)
+
+For durable, multi-host deployments, both stores ship a DB-API 2.0
+backend that works with any compliant driver — covering
+**sqlite** (stdlib), **PostgreSQL** (incl. AWS Aurora PG +
+RDS Proxy), and **MySQL** (incl. Aurora MySQL):
+
+```python
+import psycopg  # or psycopg2, pg8000, PyMySQL, mysqlclient, mysql-connector-python
+from ai_assistant_client.persistence import (
+    Dialect, SqlTranscriptStore, SqlConversationStore,
+)
+
+conn = psycopg.connect("postgresql://...")
+transcripts = SqlTranscriptStore(conn, dialect=Dialect.POSTGRESQL)
+conversations = SqlConversationStore(conn, dialect=Dialect.POSTGRESQL)
+```
+
+Why this shape:
+
+- **Zero new dependencies in this package.** You install whichever driver matches your DB. Keeps the credential surface to first-party drivers you've already vetted, in the same spirit as the [no-LiteLLM rationale](#why-a-custom-provider-abstraction-and-not-litellmaisuite).
+- **Caller owns the connection.** IAM token minting, TLS config, RDS Proxy endpoints, and pooling all stay upstream where they belong.
+- **Aurora Serverless v2** uses standard wire protocol — same drivers work. (Aurora Serverless v1's HTTP Data API is the one path that *doesn't* work via DB-API — but v1 is the legacy variant.)
+- **Schema is created on first use** (`CREATE TABLE IF NOT EXISTS`). Tables: `aac_transcript_runs`, `aac_transcript_events`, `aac_conversation_messages`.
+
+Known limitation (v1): the per-id `seq` is computed as `SELECT COALESCE(MAX(seq), 0) + 1` inside a transaction. Within one process the store's `asyncio.Lock` makes this safe; **cross-process concurrent writes to the same id** are racy and may collide on the `(id, seq)` unique constraint. Workflow runs each get a unique `run_id` so this rarely bites in practice — but if you fan recorders across processes writing to one conversation, run a single leader recorder or switch to a per-id database sequence.
 
 ## Visuals (charts, tables, KPI tiles, images)
 

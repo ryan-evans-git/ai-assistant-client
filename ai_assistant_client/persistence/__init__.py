@@ -40,13 +40,20 @@ from ai_assistant_client.persistence.conversation_memory import (
 from ai_assistant_client.persistence.factory import (
     CONVERSATION_BACKEND_ENV,
     CONVERSATION_DIR_ENV,
+    CONVERSATION_SQLITE_PATH_ENV,
     TRANSCRIPT_BACKEND_ENV,
     TRANSCRIPT_DIR_ENV,
+    TRANSCRIPT_SQLITE_PATH_ENV,
     make_conversation_store,
     make_transcript_store,
 )
 from ai_assistant_client.persistence.file import FileTranscriptStore
 from ai_assistant_client.persistence.memory import InMemoryTranscriptStore
+from ai_assistant_client.persistence.sql_common import Dialect
+from ai_assistant_client.persistence.sql_conversation import (
+    SqlConversationStore,
+)
+from ai_assistant_client.persistence.sql_transcript import SqlTranscriptStore
 from ai_assistant_client.persistence.transcript import (
     RunFooter,
     RunHeader,
@@ -58,7 +65,9 @@ from ai_assistant_client.persistence.transcript import (
 __all__ = [
     "CONVERSATION_BACKEND_ENV",
     "CONVERSATION_DIR_ENV",
+    "CONVERSATION_SQLITE_PATH_ENV",
     "ConversationStore",
+    "Dialect",
     "FileConversationStore",
     "FileTranscriptStore",
     "InMemoryConversationStore",
@@ -67,8 +76,11 @@ __all__ = [
     "RunFooter",
     "RunHeader",
     "RunTranscript",
+    "SqlConversationStore",
+    "SqlTranscriptStore",
     "TRANSCRIPT_BACKEND_ENV",
     "TRANSCRIPT_DIR_ENV",
+    "TRANSCRIPT_SQLITE_PATH_ENV",
     "TranscriptStore",
     "make_conversation_store",
     "make_transcript_store",
