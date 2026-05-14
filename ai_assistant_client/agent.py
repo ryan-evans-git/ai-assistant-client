@@ -22,7 +22,16 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Literal
 
 from ai_assistant_client.confirmation_store import ConfirmationOutcome
 from ai_assistant_client.discovery import ProgressiveToolRegistry
-from ai_assistant_client.persistence import ConversationStore, TranscriptStore
+from ai_assistant_client.memory_meta import (
+    handle_memory_meta_call,
+    is_memory_meta_tool,
+    memory_meta_tool_schemas,
+)
+from ai_assistant_client.persistence import (
+    ConversationStore,
+    MemoryStore,
+    TranscriptStore,
+)
 from ai_assistant_client.workflows import WorkflowRegistry, run_workflow
 from ai_assistant_client.workflows.replay import run_workflow_recording
 from ai_assistant_client.llm import (
@@ -148,6 +157,8 @@ async def run_agent(
     conversation_store: ConversationStore | None = None,
     conversation_id: str | None = None,
     transcript_store: TranscriptStore | None = None,
+    memory_store: MemoryStore | None = None,
+    user_id: str | None = None,
 ) -> AsyncIterator[AgentEvent]:
     """Run one user turn end-to-end.
 
@@ -185,6 +196,14 @@ async def run_agent(
     in store listings.  ``None`` (the default) keeps the
     pre-recording dispatch path unchanged.
 
+    ``memory_store`` + ``user_id``: when **both** are set, the
+    LLM-callable memory meta-tools (``memory_recall``,
+    ``memory_remember``, ``memory_forget``) are surfaced to the
+    model.  All operations close over ``user_id`` from the
+    agent's context — the model can't pass a different one — so
+    per-user isolation is preserved at the dispatch layer too.
+    Either ``None`` and the memory tools stay invisible.
+
     History is stored in Anthropic-style block form regardless of
     which provider is in use; each provider adapter translates on
     the way out.
@@ -194,6 +213,12 @@ async def run_agent(
     # half-configured persistence is exactly the kind of "did the
     # data make it to disk?" ambiguity that bites later.
     persist = conversation_store is not None and conversation_id is not None
+
+    # Same well-formed-shape rule for memory: tools only surface
+    # when both a store and a user id are wired, so a misconfig
+    # can't accidentally expose the recall surface without
+    # isolation.
+    memory_enabled = memory_store is not None and user_id is not None
 
     async def _record(message: dict[str, Any]) -> None:
         if persist:
@@ -222,6 +247,12 @@ async def run_agent(
 
         for iteration in range(config.max_tool_iterations):
             tools = registry.anthropic_tools()
+            # Surface the memory meta-tools only when the host has
+            # wired both a store and a user_id.  Prepending keeps
+            # them at a stable position in the catalog so the
+            # prompt prefix stays cache-friendly turn over turn.
+            if memory_enabled:
+                tools = memory_meta_tool_schemas() + tools
             log.debug("Iteration %d: %d tools in window", iteration, len(tools))
 
             accumulated_text: list[str] = []
@@ -337,6 +368,7 @@ async def run_agent(
                     not registry.is_meta_tool(tool_name)
                     and not registry.is_visual_tool(tool_name)
                     and not is_workflow_call
+                    and not (memory_enabled and is_memory_meta_tool(tool_name))
                 ):
                     descriptor = registry.get_descriptor(tool_name)
                     hitl = (descriptor.hitl if descriptor else None) or None
@@ -373,7 +405,23 @@ async def run_agent(
                     )
                     continue
                 try:
-                    if registry.is_meta_tool(tool_name):
+                    if memory_enabled and is_memory_meta_tool(tool_name):
+                        # Memory meta-tools run inline like the other
+                        # meta-tools.  ``user_id`` comes from the
+                        # agent's context (closed over), not from
+                        # the LLM-supplied input — load-bearing for
+                        # cross-user isolation.
+                        assert memory_store is not None and user_id is not None
+                        memory_args = (
+                            tool_input if isinstance(tool_input, dict) else {}
+                        )
+                        result_text = await handle_memory_meta_call(
+                            tool_name,
+                            memory_args,
+                            store=memory_store,
+                            user_id=user_id,
+                        )
+                    elif registry.is_meta_tool(tool_name):
                         result_text = registry.handle_meta_call(tool_name, tool_input)
                     elif registry.is_visual_tool(tool_name):
                         # Validate the spec; emit the visual event when
