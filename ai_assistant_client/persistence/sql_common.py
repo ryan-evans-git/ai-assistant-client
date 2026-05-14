@@ -155,6 +155,7 @@ _TRANSCRIPT_EVENTS_DDL: dict[Dialect, str] = {
             payload_json TEXT,
             value_json   TEXT,
             error        TEXT,
+            ts           TEXT NOT NULL DEFAULT '',
             PRIMARY KEY (run_id, seq)
         )
     """,
@@ -166,6 +167,7 @@ _TRANSCRIPT_EVENTS_DDL: dict[Dialect, str] = {
             payload_json TEXT,
             value_json   TEXT,
             error        TEXT,
+            ts           TEXT NOT NULL DEFAULT '',
             PRIMARY KEY (run_id, seq)
         )
     """,
@@ -177,6 +179,7 @@ _TRANSCRIPT_EVENTS_DDL: dict[Dialect, str] = {
             payload_json MEDIUMTEXT,
             value_json   MEDIUMTEXT,
             error        TEXT,
+            ts           VARCHAR(64) NOT NULL DEFAULT '',
             PRIMARY KEY (run_id, seq)
         )
     """,

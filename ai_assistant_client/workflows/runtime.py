@@ -20,6 +20,7 @@ import logging
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Awaitable, Callable, Iterator, Literal
 
 from ai_assistant_client.confirmation_store import ConfirmationOutcome
@@ -33,9 +34,33 @@ log = logging.getLogger(__name__)
 ConfirmationHook = Callable[[dict[str, Any]], Awaitable[ConfirmationOutcome]]
 
 
+def _utc_iso_now() -> str:
+    """ISO-8601 UTC timestamp for event creation.
+
+    Centralised so every event-emitting site stamps the same
+    format and so tests can monkey-patch one symbol when they
+    need determinism.  The runtime is the single source of truth
+    for event time; the recorder (see
+    :mod:`ai_assistant_client.workflows.replay`) just passes
+    them through.
+    """
+    return datetime.now(timezone.utc).isoformat()
+
+
 @dataclass
 class WorkflowEvent:
-    """Anything a workflow run can emit through the runtime queue."""
+    """Anything a workflow run can emit through the runtime queue.
+
+    ``timestamp`` is the ISO-8601 UTC time the event was created,
+    stamped automatically by :func:`emit_status` /
+    :func:`pause_for_confirmation` / :func:`run_workflow`.  An
+    empty string (the field default) means "unknown" — this is
+    what you'll see when reading a transcript recorded by a
+    pre-timestamp version of the client.  Don't sort by
+    timestamp alone if you might be reading old data; use the
+    persistence-layer ``seq`` (SQL) or file-line order as the
+    tiebreaker.
+    """
 
     type: Literal[
         "status",
@@ -47,6 +72,12 @@ class WorkflowEvent:
     payload: dict[str, Any] | None = None
     value: Any = None
     error: str | None = None
+    # Default empty so a WorkflowEvent reconstructed from an old
+    # transcript (recorded before timestamps shipped) reads as
+    # "time unknown" instead of being silently re-stamped with
+    # ``now``.  Live-emitting helpers (:func:`emit_status` etc.)
+    # always pass an explicit value via :func:`_utc_iso_now`.
+    timestamp: str = ""
 
 
 @dataclass
@@ -123,7 +154,11 @@ async def pause_for_confirmation(
     if message:
         payload["message"] = message
     await ctx.queue.put(
-        WorkflowEvent(type="confirmation_request", payload=payload)
+        WorkflowEvent(
+            type="confirmation_request",
+            payload=payload,
+            timestamp=_utc_iso_now(),
+        )
     )
 
     if ctx.confirmation_hook is None:
@@ -155,6 +190,7 @@ async def pause_for_confirmation(
                 "decision": outcome.decision,
                 "note": outcome.note,
             },
+            timestamp=_utc_iso_now(),
         )
     )
     return outcome
@@ -178,7 +214,11 @@ async def emit_status(message: str, *, data: Any = None) -> None:
     }
     if data is not None:
         payload["data"] = data
-    await ctx.queue.put(WorkflowEvent(type="status", payload=payload))
+    await ctx.queue.put(
+        WorkflowEvent(
+            type="status", payload=payload, timestamp=_utc_iso_now()
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -216,7 +256,11 @@ async def run_workflow(
         try:
             with _bind_context(ctx):
                 result = await wf.handler(**args)
-            await queue.put(WorkflowEvent(type="result", value=result))
+            await queue.put(
+                WorkflowEvent(
+                    type="result", value=result, timestamp=_utc_iso_now()
+                )
+            )
         except TypeError as err:
             # Argument-shape mismatch from the LLM — surface as a
             # tool error, not a workflow crash.
@@ -224,6 +268,7 @@ async def run_workflow(
                 WorkflowEvent(
                     type="error",
                     error=f"workflow {wf.name!r} rejected arguments: {err}",
+                    timestamp=_utc_iso_now(),
                 )
             )
         except Exception as err:  # noqa: BLE001
@@ -232,6 +277,7 @@ async def run_workflow(
                 WorkflowEvent(
                     type="error",
                     error=f"workflow {wf.name!r} raised: {err}",
+                    timestamp=_utc_iso_now(),
                 )
             )
 

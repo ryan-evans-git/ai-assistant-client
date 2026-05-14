@@ -135,8 +135,8 @@ class SqlTranscriptStore:
         )
         insert_sql = adapt_sql(
             "INSERT INTO aac_transcript_events "
-            "(run_id, seq, event_type, payload_json, value_json, error) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
+            "(run_id, seq, event_type, payload_json, value_json, error, ts) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
             self._dialect,
         )
 
@@ -158,6 +158,7 @@ class SqlTranscriptStore:
                         to_json(event.payload) if event.payload is not None else None,
                         to_json(event.value) if event.value is not None else None,
                         event.error,
+                        event.timestamp,
                     ),
                 )
                 self._conn.commit()
@@ -212,7 +213,7 @@ class SqlTranscriptStore:
             self._dialect,
         )
         events_sql = adapt_sql(
-            "SELECT event_type, payload_json, value_json, error "
+            "SELECT event_type, payload_json, value_json, error, ts "
             "FROM aac_transcript_events WHERE run_id = ? ORDER BY seq ASC",
             self._dialect,
         )
@@ -245,6 +246,7 @@ class SqlTranscriptStore:
                             payload=from_json(ev_row[1]),
                             value=from_json(ev_row[2]),
                             error=ev_row[3],
+                            timestamp=ev_row[4] or "",
                         )
                     )
                 return RunTranscript(
