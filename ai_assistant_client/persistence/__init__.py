@@ -27,6 +27,24 @@ and :func:`make_conversation_store`).
 
 from __future__ import annotations
 
+from ai_assistant_client.persistence.aiomysql_conversation import (
+    AiomysqlConversationStore,
+)
+from ai_assistant_client.persistence.aiomysql_memory import (
+    AiomysqlMemoryStore,
+)
+from ai_assistant_client.persistence.aiomysql_transcript import (
+    AiomysqlTranscriptStore,
+)
+from ai_assistant_client.persistence.asyncpg_conversation import (
+    AsyncpgConversationStore,
+)
+from ai_assistant_client.persistence.asyncpg_memory import (
+    AsyncpgMemoryStore,
+)
+from ai_assistant_client.persistence.asyncpg_transcript import (
+    AsyncpgTranscriptStore,
+)
 from ai_assistant_client.persistence.conversation import (
     ConversationStore,
     Message,
@@ -53,23 +71,9 @@ from ai_assistant_client.persistence.factory import (
 )
 from ai_assistant_client.persistence.file import FileTranscriptStore
 from ai_assistant_client.persistence.memory import InMemoryTranscriptStore
-from ai_assistant_client.persistence.aiomysql_conversation import (
-    AiomysqlConversationStore,
-)
-from ai_assistant_client.persistence.aiomysql_memory import (
-    AiomysqlMemoryStore,
-)
-from ai_assistant_client.persistence.aiomysql_transcript import (
-    AiomysqlTranscriptStore,
-)
-from ai_assistant_client.persistence.asyncpg_conversation import (
-    AsyncpgConversationStore,
-)
-from ai_assistant_client.persistence.asyncpg_memory import (
-    AsyncpgMemoryStore,
-)
-from ai_assistant_client.persistence.asyncpg_transcript import (
-    AsyncpgTranscriptStore,
+from ai_assistant_client.persistence.migrate import (
+    add_column_if_missing,
+    ensure_transcript_events_ts_column,
 )
 from ai_assistant_client.persistence.sql_common import Dialect
 from ai_assistant_client.persistence.sql_conversation import (
@@ -122,6 +126,8 @@ __all__ = [
     "TRANSCRIPT_DIR_ENV",
     "TRANSCRIPT_SQLITE_PATH_ENV",
     "TranscriptStore",
+    "add_column_if_missing",
+    "ensure_transcript_events_ts_column",
     "make_conversation_store",
     "make_memory_store",
     "make_transcript_store",
