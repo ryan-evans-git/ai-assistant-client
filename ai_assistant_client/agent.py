@@ -22,6 +22,7 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Literal
 
 from ai_assistant_client.confirmation_store import ConfirmationOutcome
 from ai_assistant_client.discovery import ProgressiveToolRegistry
+from ai_assistant_client.persistence import ConversationStore
 from ai_assistant_client.workflows import WorkflowRegistry, run_workflow
 from ai_assistant_client.llm import (
     CacheHint,
@@ -143,6 +144,8 @@ async def run_agent(
     auditor_provider: LLMProvider | None = None,
     confirmation_hook: ConfirmationHook | None = None,
     workflow_registry: WorkflowRegistry | None = None,
+    conversation_store: ConversationStore | None = None,
+    conversation_id: str | None = None,
 ) -> AsyncIterator[AgentEvent]:
     """Run one user turn end-to-end.
 
@@ -164,11 +167,36 @@ async def run_agent(
     used for the auditor LLM when ``validation_mode`` is ``"audit"`` or
     ``"hybrid"``.  Defaults to ``provider``.
 
+    ``conversation_store`` + ``conversation_id``: when both are set,
+    every message appended to ``history`` is mirrored into the
+    store under that id.  This is *write-only* from the agent's
+    perspective — the caller is responsible for loading prior
+    turns out of the store and seeding ``history`` (so the
+    store-read path stays a host-side decision, not a hidden
+    side-effect of ``run_agent``).  Either ``None`` disables
+    persistence entirely.
+
     History is stored in Anthropic-style block form regardless of
     which provider is in use; each provider adapter translates on
     the way out.
     """
-    history.append({"role": "user", "content": user_message})
+    # Only persist when BOTH a store and an id are provided — the
+    # combination is the well-formed shape, and silently ignoring
+    # half-configured persistence is exactly the kind of "did the
+    # data make it to disk?" ambiguity that bites later.
+    persist = conversation_store is not None and conversation_id is not None
+
+    async def _record(message: dict[str, Any]) -> None:
+        if persist:
+            # ``persist`` only becomes True when both checks pass,
+            # but the type-checker can't see that across the
+            # closure; the ``assert`` is for it, not for runtime.
+            assert conversation_store is not None and conversation_id is not None
+            await conversation_store.append(conversation_id, message)
+
+    user_turn = {"role": "user", "content": user_message}
+    history.append(user_turn)
+    await _record(user_turn)
     yield AgentEvent("user_message", {"content": user_message})
 
     effective_system_prompt = (
@@ -266,7 +294,9 @@ async def run_agent(
                         "input": tu["input"],
                     }
                 )
-            history.append({"role": "assistant", "content": assistant_blocks})
+            assistant_turn = {"role": "assistant", "content": assistant_blocks}
+            history.append(assistant_turn)
+            await _record(assistant_turn)
 
             if stop_reason != "tool_use" or not ordered_tool_uses:
                 last_assistant_text = joined_text
@@ -435,7 +465,9 @@ async def run_agent(
                         "tool_error", {"id": tu_id, "name": tool_name, "error": str(err)}
                     )
 
-            history.append({"role": "user", "content": tool_result_content})
+            tool_result_turn = {"role": "user", "content": tool_result_content}
+            history.append(tool_result_turn)
+            await _record(tool_result_turn)
 
         if not terminated_normally:
             yield AgentEvent(
@@ -483,7 +515,9 @@ async def run_agent(
         # hosts that want to hide it can detect the "[validation] "
         # prefix.
         feedback = build_retry_feedback(result)
-        history.append({"role": "user", "content": feedback})
+        feedback_turn = {"role": "user", "content": feedback}
+        history.append(feedback_turn)
+        await _record(feedback_turn)
         retries_remaining -= 1
         yield AgentEvent(
             "validation_retry",

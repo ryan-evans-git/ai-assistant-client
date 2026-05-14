@@ -1,11 +1,15 @@
-"""Backend selection for :class:`TranscriptStore`.
+"""Backend selection for the persistence stores.
 
-The host picks a backend by env var so application code stays
-agnostic to the storage choice:
+Each store gets its own pair of env vars so a host can pick
+backends independently — e.g. transcripts in memory (cheap, lossy)
+while conversations go to disk (durable across restarts):
 
-* ``AAC_TRANSCRIPT_BACKEND`` — ``memory`` (default) or ``file``.
-* ``AAC_TRANSCRIPT_DIR`` — base directory for the ``file``
-  backend; defaults to ``./transcripts``.
+* ``AAC_TRANSCRIPT_BACKEND`` / ``AAC_TRANSCRIPT_DIR`` — workflow
+  run transcripts (see
+  :class:`~ai_assistant_client.persistence.transcript.TranscriptStore`).
+* ``AAC_CONVERSATION_BACKEND`` / ``AAC_CONVERSATION_DIR`` —
+  conversation message logs (see
+  :class:`~ai_assistant_client.persistence.conversation.ConversationStore`).
 
 When new backends land (SQL on a local DB, SQL on a managed cloud
 DB, etc.) they slot in here.  Each backend constructor accepts
@@ -17,6 +21,13 @@ from __future__ import annotations
 
 import os
 
+from ai_assistant_client.persistence.conversation import ConversationStore
+from ai_assistant_client.persistence.conversation_file import (
+    FileConversationStore,
+)
+from ai_assistant_client.persistence.conversation_memory import (
+    InMemoryConversationStore,
+)
 from ai_assistant_client.persistence.file import FileTranscriptStore
 from ai_assistant_client.persistence.memory import InMemoryTranscriptStore
 from ai_assistant_client.persistence.transcript import TranscriptStore
@@ -25,7 +36,11 @@ from ai_assistant_client.persistence.transcript import TranscriptStore
 TRANSCRIPT_BACKEND_ENV = "AAC_TRANSCRIPT_BACKEND"
 TRANSCRIPT_DIR_ENV = "AAC_TRANSCRIPT_DIR"
 
-_DEFAULT_FILE_DIR = "./transcripts"
+CONVERSATION_BACKEND_ENV = "AAC_CONVERSATION_BACKEND"
+CONVERSATION_DIR_ENV = "AAC_CONVERSATION_DIR"
+
+_DEFAULT_TRANSCRIPT_DIR = "./transcripts"
+_DEFAULT_CONVERSATION_DIR = "./conversations"
 
 
 def make_transcript_store(
@@ -44,10 +59,35 @@ def make_transcript_store(
         return InMemoryTranscriptStore()
     if resolved == "file":
         directory = base_dir or os.environ.get(
-            TRANSCRIPT_DIR_ENV, _DEFAULT_FILE_DIR
+            TRANSCRIPT_DIR_ENV, _DEFAULT_TRANSCRIPT_DIR
         )
         return FileTranscriptStore(directory)
     raise ValueError(
         f"unknown transcript backend {resolved!r} — expected one of: "
+        "memory, file"
+    )
+
+
+def make_conversation_store(
+    *, kind: str | None = None, base_dir: str | None = None
+) -> ConversationStore:
+    """Construct a conversation store from env vars (or explicit args).
+
+    Mirror of :func:`make_transcript_store` for the parallel
+    :class:`ConversationStore` protocol.  Same fail-loud rule for
+    unknown backends.
+    """
+    resolved = (
+        kind or os.environ.get(CONVERSATION_BACKEND_ENV) or "memory"
+    ).lower()
+    if resolved == "memory":
+        return InMemoryConversationStore()
+    if resolved == "file":
+        directory = base_dir or os.environ.get(
+            CONVERSATION_DIR_ENV, _DEFAULT_CONVERSATION_DIR
+        )
+        return FileConversationStore(directory)
+    raise ValueError(
+        f"unknown conversation backend {resolved!r} — expected one of: "
         "memory, file"
     )

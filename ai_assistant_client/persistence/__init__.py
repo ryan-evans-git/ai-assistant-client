@@ -1,30 +1,48 @@
-"""Pluggable persistence for workflow transcripts and (future)
-conversation history / per-user memory.
+"""Pluggable persistence for workflow transcripts and conversation
+history.
 
-The :class:`TranscriptStore` protocol is the single abstraction the
-rest of the client talks to.  Concrete backends in this package:
+Two parallel protocols, each with two backends to start:
 
-* :class:`InMemoryTranscriptStore` — dict-backed, default for dev
-  and tests.  Loses data on process exit.
-* :class:`FileTranscriptStore` — JSON-lines on local disk, one
-  file per run id.  Survives restarts; suitable for single-host
-  deployments and CI captures.
+* :class:`TranscriptStore` — bracketed (header + events + footer)
+  records of a single workflow run.
+  Implementations: :class:`InMemoryTranscriptStore`,
+  :class:`FileTranscriptStore` (JSONL on disk).
+* :class:`ConversationStore` — open-ended append-only log of
+  Anthropic-block-style messages keyed by conversation id.
+  Implementations: :class:`InMemoryConversationStore`,
+  :class:`FileConversationStore` (JSONL on disk).
 
-Future backends (SQL/managed cloud) are out of scope for this
-package's first cut: a backend with one real consumer is cleaner
-than a backend with three placeholder ones.  When the SQL story
-lands it implements the same protocol.
+Why two protocols instead of one: workflow runs have a clear
+terminal state (the footer marks ``result`` or ``error``);
+conversations don't.  Unifying the two shapes would require
+weakening the contract enough that neither caller could trust
+it.
 
-Selection at runtime is driven by env vars (see
-:func:`make_transcript_store`) so a host can switch backends
-without touching application code.
+Future backends (SQL on a local DB, SQL on a managed cloud DB,
+etc.) plug in by implementing the relevant protocol — adding one
+backend doesn't force changes to application code.  Selection at
+runtime is driven by env vars (see :func:`make_transcript_store`
+and :func:`make_conversation_store`).
 """
 
 from __future__ import annotations
 
+from ai_assistant_client.persistence.conversation import (
+    ConversationStore,
+    Message,
+)
+from ai_assistant_client.persistence.conversation_file import (
+    FileConversationStore,
+)
+from ai_assistant_client.persistence.conversation_memory import (
+    InMemoryConversationStore,
+)
 from ai_assistant_client.persistence.factory import (
+    CONVERSATION_BACKEND_ENV,
+    CONVERSATION_DIR_ENV,
     TRANSCRIPT_BACKEND_ENV,
     TRANSCRIPT_DIR_ENV,
+    make_conversation_store,
     make_transcript_store,
 )
 from ai_assistant_client.persistence.file import FileTranscriptStore
@@ -38,13 +56,20 @@ from ai_assistant_client.persistence.transcript import (
 
 
 __all__ = [
+    "CONVERSATION_BACKEND_ENV",
+    "CONVERSATION_DIR_ENV",
+    "ConversationStore",
+    "FileConversationStore",
     "FileTranscriptStore",
+    "InMemoryConversationStore",
     "InMemoryTranscriptStore",
+    "Message",
     "RunFooter",
     "RunHeader",
     "RunTranscript",
     "TRANSCRIPT_BACKEND_ENV",
     "TRANSCRIPT_DIR_ENV",
     "TranscriptStore",
+    "make_conversation_store",
     "make_transcript_store",
 ]
