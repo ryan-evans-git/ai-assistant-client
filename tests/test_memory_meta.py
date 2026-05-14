@@ -14,6 +14,7 @@ from ai_assistant_client.memory_meta import (
     MEMORY_FORGET,
     MEMORY_RECALL,
     MEMORY_REMEMBER,
+    MEMORY_UPDATE,
     MEMORY_META_TOOL_NAMES,
     handle_memory_meta_call,
     is_memory_meta_tool,
@@ -27,14 +28,22 @@ from ai_assistant_client.persistence import LocalMemoryStore
 # ---------------------------------------------------------------------------
 
 
-def test_schemas_cover_the_three_meta_tools() -> None:
+def test_schemas_cover_the_four_meta_tools() -> None:
     schemas = memory_meta_tool_schemas()
     names = {s["name"] for s in schemas}
     assert names == MEMORY_META_TOOL_NAMES == {
         MEMORY_RECALL,
         MEMORY_REMEMBER,
+        MEMORY_UPDATE,
         MEMORY_FORGET,
     }
+
+
+def test_update_schema_requires_memory_id_and_value() -> None:
+    schema = next(
+        s for s in memory_meta_tool_schemas() if s["name"] == MEMORY_UPDATE
+    )
+    assert set(schema["input_schema"]["required"]) == {"memory_id", "value"}
 
 
 def test_remember_schema_requires_key_and_value() -> None:
@@ -57,6 +66,7 @@ def test_recall_schema_has_optional_tags() -> None:
 def test_is_memory_meta_tool() -> None:
     assert is_memory_meta_tool("memory_recall")
     assert is_memory_meta_tool("memory_remember")
+    assert is_memory_meta_tool("memory_update")
     assert is_memory_meta_tool("memory_forget")
     assert not is_memory_meta_tool("tool_search")
     assert not is_memory_meta_tool("some_remote_tool")
@@ -209,3 +219,126 @@ async def test_unknown_tool_name_returns_error_string() -> None:
         "memory_explode", {}, store=store, user_id="alice"
     )
     assert "unknown" in out.lower()
+
+
+# ---------------------------------------------------------------------------
+# memory_update — dispatch
+# ---------------------------------------------------------------------------
+
+
+async def test_update_replaces_value_and_preserves_metadata() -> None:
+    """The key, tags, and created_at of the original record must
+    survive — only value + updated_at change.  This is what
+    makes update preferable to forget+remember."""
+    store = LocalMemoryStore()
+    original = await store.add(
+        user_id="alice",
+        key="role",
+        value="data scientist",
+        tags=("work",),
+    )
+
+    out = await handle_memory_meta_call(
+        MEMORY_UPDATE,
+        {"memory_id": original.memory_id, "value": "ML engineer"},
+        store=store,
+        user_id="alice",
+    )
+    payload = json.loads(out)
+    assert payload["memory_id"] == original.memory_id
+    assert payload["key"] == "role"           # preserved
+    assert payload["tags"] == ["work"]        # preserved
+    assert payload["value"] == "ML engineer"  # changed
+    assert payload["created_at"] == original.created_at  # preserved
+    assert payload["updated_at"] >= original.updated_at  # bumped
+
+
+async def test_update_unknown_id_returns_not_found_string() -> None:
+    store = LocalMemoryStore()
+    out = await handle_memory_meta_call(
+        MEMORY_UPDATE,
+        {"memory_id": "mem_does_not_exist", "value": 1},
+        store=store,
+        user_id="alice",
+    )
+    assert "not found" in out.lower()
+
+
+async def test_update_cross_user_returns_not_found_string() -> None:
+    """Bob can't update Alice's memory — same 'not found' string
+    as a non-existent id, preserving the anti-enumeration
+    contract."""
+    store = LocalMemoryStore()
+    rec = await store.add(user_id="alice", key="x", value=1)
+
+    out = await handle_memory_meta_call(
+        MEMORY_UPDATE,
+        {"memory_id": rec.memory_id, "value": 999},
+        store=store,
+        user_id="bob",
+    )
+    assert "not found" in out.lower()
+    # Alice's memory unchanged.
+    again = await store.get(user_id="alice", memory_id=rec.memory_id)
+    assert again.value == 1
+
+
+async def test_update_user_id_in_arguments_is_ignored() -> None:
+    """Mirror of the remember-side jailbreak test: an LLM-supplied
+    user_id in the args must not escape the agent's user_id
+    context.  The update lands in Alice's record, not admin's."""
+    store = LocalMemoryStore()
+    rec = await store.add(user_id="alice", key="x", value=1)
+
+    await handle_memory_meta_call(
+        MEMORY_UPDATE,
+        {
+            "memory_id": rec.memory_id,
+            "value": 999,
+            "user_id": "admin",
+        },
+        store=store,
+        user_id="alice",
+    )
+    again = await store.get(user_id="alice", memory_id=rec.memory_id)
+    assert again.value == 999
+    # admin has nothing.
+    assert await store.list(user_id="admin") == []
+
+
+async def test_update_missing_memory_id_returns_error_string() -> None:
+    store = LocalMemoryStore()
+    out = await handle_memory_meta_call(
+        MEMORY_UPDATE, {"value": 1}, store=store, user_id="alice"
+    )
+    assert "memory_id" in out.lower()
+
+
+async def test_update_missing_value_returns_error_string() -> None:
+    """Missing ``value`` is a different failure from missing
+    ``memory_id`` — we want both to surface clearly so the
+    LLM can fix its call."""
+    store = LocalMemoryStore()
+    out = await handle_memory_meta_call(
+        MEMORY_UPDATE,
+        {"memory_id": "mem_x"},
+        store=store,
+        user_id="alice",
+    )
+    assert "value" in out.lower()
+
+
+async def test_update_value_can_be_falsy_zero_or_empty() -> None:
+    """``value: 0`` and ``value: ""`` are legitimate values, not
+    "missing".  Make sure the validator distinguishes "absent
+    key" from "falsy value"."""
+    store = LocalMemoryStore()
+    rec = await store.add(user_id="alice", key="count", value=10)
+    out = await handle_memory_meta_call(
+        MEMORY_UPDATE,
+        {"memory_id": rec.memory_id, "value": 0},
+        store=store,
+        user_id="alice",
+    )
+    payload = json.loads(out)
+    assert payload["value"] == 0
