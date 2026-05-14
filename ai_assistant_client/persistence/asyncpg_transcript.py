@@ -35,9 +35,11 @@ import json
 from typing import Any
 
 from ai_assistant_client.persistence.sql_common import (
+    SEQ_COLLISION_MAX_ATTEMPTS,
     Dialect,
     adapt_sql_asyncpg,
     from_json,
+    is_integrity_error,
     to_json,
     transcript_events_ddl,
     transcript_runs_ddl,
@@ -114,28 +116,45 @@ class AsyncpgTranscriptStore:
             "(run_id, seq, event_type, payload_json, value_json, error, ts) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)"
         )
-        async with self._pool.acquire() as conn:
-            # asyncpg's transaction context manager handles BEGIN
-            # / COMMIT / ROLLBACK; we wrap the seq calc + insert
-            # so concurrent appends to the same run id (within one
-            # process) can't race past each other inside a single
-            # database round-trip.
-            async with conn.transaction():
-                row = await conn.fetchrow(check_sql, run_id)
-                if row is None:
-                    raise KeyError(run_id)
-                seq_row = await conn.fetchrow(next_seq_sql, run_id)
-                next_seq = int(seq_row[0]) if seq_row and seq_row[0] is not None else 1
-                await conn.execute(
-                    insert_sql,
-                    run_id,
-                    next_seq,
-                    event.type,
-                    to_json(event.payload) if event.payload is not None else None,
-                    to_json(event.value) if event.value is not None else None,
-                    event.error,
-                    event.timestamp,
-                )
+        # Retry on seq-collision IntegrityError from cross-process
+        # races — same shape as SqlTranscriptStore.append_event,
+        # using asyncpg's UniqueViolationError (subclass of
+        # IntegrityError) as the trigger.  Each attempt opens a
+        # fresh transaction so the prior aborted one is cleaned up.
+        last_err: Exception | None = None
+        for _attempt in range(SEQ_COLLISION_MAX_ATTEMPTS):
+            try:
+                async with self._pool.acquire() as conn:
+                    async with conn.transaction():
+                        row = await conn.fetchrow(check_sql, run_id)
+                        if row is None:
+                            raise KeyError(run_id)
+                        seq_row = await conn.fetchrow(next_seq_sql, run_id)
+                        next_seq = (
+                            int(seq_row[0])
+                            if seq_row and seq_row[0] is not None
+                            else 1
+                        )
+                        await conn.execute(
+                            insert_sql,
+                            run_id,
+                            next_seq,
+                            event.type,
+                            to_json(event.payload) if event.payload is not None else None,
+                            to_json(event.value) if event.value is not None else None,
+                            event.error,
+                            event.timestamp,
+                        )
+                return
+            except KeyError:
+                raise
+            except Exception as err:
+                if is_integrity_error(err):
+                    last_err = err
+                    continue
+                raise
+        assert last_err is not None
+        raise last_err
 
     async def write_footer(self, run_id: str, footer: RunFooter) -> None:
         await self._ensure_schema()

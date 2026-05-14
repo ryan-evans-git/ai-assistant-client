@@ -135,10 +135,14 @@ class AiomysqlMemoryStore(MemoryStore):
         tags: Iterable[str] | None = None,
     ) -> list[Memory]:
         await self._ensure_schema()
+        # memory_id tiebreak — see SqlMemoryStore.list for the
+        # full rationale (deterministic order even under the
+        # cross-process MAX(seq)+1 race).
         sql = adapt_sql(
             "SELECT memory_id, mkey, value_json, tags_json, "
             "created_at, updated_at "
-            "FROM aac_user_memories WHERE user_id = ? ORDER BY seq ASC",
+            "FROM aac_user_memories WHERE user_id = ? "
+            "ORDER BY seq ASC, memory_id ASC",
             Dialect.MYSQL,
         )
         wanted: set[str] | None = set(tags) if tags is not None else None

@@ -178,10 +178,17 @@ class SqlMemoryStore(MemoryStore):
         tags: Iterable[str] | None = None,
     ) -> list[Memory]:
         await self._ensure_schema()
+        # ``memory_id`` as a deterministic tiebreak: if two
+        # processes computed the same ``seq`` (cross-process
+        # MAX+1 race; within a process the asyncio.Lock prevents
+        # it), reads still return them in a stable order rather
+        # than the DB engine's arbitrary tie-break.  memory_id is
+        # the PK so the tiebreak is guaranteed unique.
         sql = adapt_sql(
             "SELECT memory_id, mkey, value_json, tags_json, "
             "created_at, updated_at "
-            "FROM aac_user_memories WHERE user_id = ? ORDER BY seq ASC",
+            "FROM aac_user_memories WHERE user_id = ? "
+            "ORDER BY seq ASC, memory_id ASC",
             self._dialect,
         )
         wanted: set[str] | None = set(tags) if tags is not None else None
