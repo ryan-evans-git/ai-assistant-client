@@ -17,7 +17,7 @@ from __future__ import annotations
 import sqlite3
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import pytest
 
@@ -39,13 +39,14 @@ from ai_assistant_client.persistence.factory import (
 # ---------------------------------------------------------------------------
 
 
-def _sqlite_conn(tmp_path: Path) -> sqlite3.Connection:
-    return sqlite3.connect(tmp_path / "memory.sqlite3", check_same_thread=False)
+SqliteConnFactory = Callable[..., sqlite3.Connection]
 
 
 @pytest.fixture
-def sql_store(tmp_path: Path) -> SqlMemoryStore:
-    return SqlMemoryStore(_sqlite_conn(tmp_path), dialect=Dialect.SQLITE)
+def sql_store(make_sqlite_conn: SqliteConnFactory) -> SqlMemoryStore:
+    return SqlMemoryStore(
+        make_sqlite_conn("memory.sqlite3"), dialect=Dialect.SQLITE
+    )
 
 
 async def test_sql_add_and_get_round_trip(sql_store: SqlMemoryStore) -> None:
@@ -158,14 +159,14 @@ async def test_sql_list_users(sql_store: SqlMemoryStore) -> None:
     assert set(users) == {"alice", "bob"}
 
 
-async def test_sql_survives_reopen(tmp_path: Path) -> None:
+async def test_sql_survives_reopen(make_sqlite_conn: SqliteConnFactory) -> None:
     """Cross-connection durability — same DB file."""
-    conn1 = sqlite3.connect(tmp_path / "m.sqlite3", check_same_thread=False)
+    conn1 = make_sqlite_conn("m.sqlite3")
     s1 = SqlMemoryStore(conn1, dialect=Dialect.SQLITE)
     rec = await s1.add(user_id="alice", key="x", value="hello")
     conn1.close()
 
-    conn2 = sqlite3.connect(tmp_path / "m.sqlite3", check_same_thread=False)
+    conn2 = make_sqlite_conn("m.sqlite3")
     s2 = SqlMemoryStore(conn2, dialect=Dialect.SQLITE)
     again = await s2.get(user_id="alice", memory_id=rec.memory_id)
     assert again.value == "hello"

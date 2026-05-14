@@ -14,8 +14,7 @@ Strategy:
 from __future__ import annotations
 
 import sqlite3
-from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import pytest
 
@@ -31,14 +30,21 @@ from ai_assistant_client.persistence.migrate import (
 )
 
 
+SqliteConnFactory = Callable[..., sqlite3.Connection]
+
+
 # ---------------------------------------------------------------------------
 # sqlite — end-to-end against a real connection
 # ---------------------------------------------------------------------------
 
 
-def _make_legacy_events_table(path: Path) -> sqlite3.Connection:
-    """Create the events table in its pre-timestamp shape (no ``ts``)."""
-    conn = sqlite3.connect(path, check_same_thread=False)
+def _make_legacy_events_table(conn: sqlite3.Connection) -> sqlite3.Connection:
+    """Stamp ``conn`` with the events table in its pre-timestamp shape.
+
+    Returns the same connection so tests can use ``conn = make_legacy(...)``
+    fluently.  The caller is responsible for opening / closing — this
+    helper just runs the DDL.
+    """
     conn.execute(
         """
         CREATE TABLE aac_transcript_events (
@@ -56,8 +62,10 @@ def _make_legacy_events_table(path: Path) -> sqlite3.Connection:
     return conn
 
 
-def test_sqlite_adds_ts_to_legacy_table(tmp_path: Path) -> None:
-    conn = _make_legacy_events_table(tmp_path / "old.sqlite3")
+def test_sqlite_adds_ts_to_legacy_table(
+    make_sqlite_conn: SqliteConnFactory,
+) -> None:
+    conn = _make_legacy_events_table(make_sqlite_conn("old.sqlite3"))
     assert not _has_column(
         conn, dialect=Dialect.SQLITE, table="aac_transcript_events",
         column="ts",
@@ -70,8 +78,10 @@ def test_sqlite_adds_ts_to_legacy_table(tmp_path: Path) -> None:
     )
 
 
-def test_sqlite_idempotent_on_second_call(tmp_path: Path) -> None:
-    conn = _make_legacy_events_table(tmp_path / "old.sqlite3")
+def test_sqlite_idempotent_on_second_call(
+    make_sqlite_conn: SqliteConnFactory,
+) -> None:
+    conn = _make_legacy_events_table(make_sqlite_conn("old.sqlite3"))
     ensure_transcript_events_ts_column(conn, dialect=Dialect.SQLITE)
     added_again = ensure_transcript_events_ts_column(
         conn, dialect=Dialect.SQLITE
@@ -79,11 +89,13 @@ def test_sqlite_idempotent_on_second_call(tmp_path: Path) -> None:
     assert added_again is False
 
 
-def test_sqlite_existing_rows_get_default_empty_ts(tmp_path: Path) -> None:
+def test_sqlite_existing_rows_get_default_empty_ts(
+    make_sqlite_conn: SqliteConnFactory,
+) -> None:
     """An old row inserted before the migration must read back
     with ts='' after — matches the WorkflowEvent.timestamp
     default for "unknown" timestamps."""
-    conn = _make_legacy_events_table(tmp_path / "old.sqlite3")
+    conn = _make_legacy_events_table(make_sqlite_conn("old.sqlite3"))
     conn.execute(
         "INSERT INTO aac_transcript_events "
         "(run_id, seq, event_type, payload_json, value_json, error) "
@@ -101,9 +113,11 @@ def test_sqlite_existing_rows_get_default_empty_ts(tmp_path: Path) -> None:
     assert rows == [("",)]
 
 
-def test_add_column_if_missing_generic_round_trip(tmp_path: Path) -> None:
+def test_add_column_if_missing_generic_round_trip(
+    make_sqlite_conn: SqliteConnFactory,
+) -> None:
     """Sanity-check the generic helper on a non-canonical column."""
-    conn = sqlite3.connect(tmp_path / "g.sqlite3", check_same_thread=False)
+    conn = make_sqlite_conn("g.sqlite3")
     conn.execute("CREATE TABLE widgets (id INTEGER PRIMARY KEY)")
     conn.commit()
 

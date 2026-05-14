@@ -21,7 +21,7 @@ from __future__ import annotations
 import sqlite3
 import textwrap
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from ai_assistant_client.confirmation_store import ConfirmationOutcome
 from ai_assistant_client.persistence import (
@@ -39,6 +39,9 @@ from ai_assistant_client.workflows import (
 )
 from ai_assistant_client.workflows.replay import run_workflow_recording
 from ai_assistant_client.workflows.runtime import WorkflowEvent
+
+
+SqliteConnFactory = Callable[..., sqlite3.Connection]
 
 
 # ---------------------------------------------------------------------------
@@ -206,7 +209,9 @@ async def test_file_store_round_trips_timestamps(tmp_path: Path) -> None:
     assert all(e.timestamp != "" for e in transcript.events)
 
 
-async def test_sql_store_round_trips_timestamps(tmp_path: Path) -> None:
+async def test_sql_store_round_trips_timestamps(
+    make_sqlite_conn: SqliteConnFactory,
+) -> None:
     @workflow(description="d")
     async def go() -> str:
         await emit_status("hello")
@@ -214,7 +219,7 @@ async def test_sql_store_round_trips_timestamps(tmp_path: Path) -> None:
 
     wf = get_workflow(go)
     assert wf is not None
-    conn = sqlite3.connect(tmp_path / "t.sqlite3", check_same_thread=False)
+    conn = make_sqlite_conn("t.sqlite3")
     store = SqlTranscriptStore(conn, dialect=Dialect.SQLITE)
     async for _ in run_workflow_recording(
         wf, {}, tool_use_id="tu", confirmation_hook=None,

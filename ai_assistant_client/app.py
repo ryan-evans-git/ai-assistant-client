@@ -388,7 +388,7 @@ def main(argv: list[str] | None = None) -> int:
     graph_parser.add_argument("run_id", help="Run id to render.")
     graph_parser.add_argument(
         "--kind",
-        choices=("flowchart", "sequence"),
+        choices=("flowchart", "sequence", "gantt"),
         default="flowchart",
         help="Mermaid diagram kind (default: flowchart).",
     )
