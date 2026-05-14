@@ -26,12 +26,38 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import tempfile
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
 from ai_assistant_client.persistence.user_memory import Memory, MemoryStore
+
+
+@dataclass(frozen=True)
+class CompactionStats:
+    """Outcome of a :meth:`FileMemoryStore.compact` call.
+
+    ``before_lines`` is the on-disk log size pre-compaction;
+    ``after_lines`` is the count post-compaction (one ``add`` line
+    per live record).  ``bytes_saved`` is the difference in file
+    size — useful for an operator deciding when to compact next.
+    Returned even on no-op compactions (``before == after``) so a
+    scheduler can detect "nothing to do" cheaply.
+    """
+
+    user_id: str
+    before_lines: int
+    after_lines: int
+    before_bytes: int
+    after_bytes: int
+
+    @property
+    def bytes_saved(self) -> int:
+        return max(0, self.before_bytes - self.after_bytes)
 
 
 def _utc_iso() -> str:
@@ -244,6 +270,99 @@ class FileMemoryStore(MemoryStore):
             await asyncio.to_thread(path.unlink)
             return count
 
+    async def compact(self, *, user_id: str) -> CompactionStats:
+        """Rewrite the user's log so only the live state remains.
+
+        The append-only log grows as memories are added, updated,
+        and removed.  After many turns of a chatty user, the log
+        can contain orders of magnitude more entries than the
+        live record count.  Compaction replays the log to
+        reconstruct the live state, then writes a fresh log
+        containing just one ``add`` per live record — preserving
+        each memory's ``memory_id`` / ``key`` / ``tags`` / value
+        / ``created_at`` / ``updated_at`` exactly as they were.
+
+        Atomicity: the new log is written to a tempfile in the
+        same directory, then ``os.replace``'d into the original
+        path.  ``os.replace`` is atomic on POSIX (and Windows
+        since Python 3.3), so a crash mid-write leaves the
+        original file untouched.  The temp file is cleaned up
+        on any path that raises before the rename.
+
+        Concurrency: the per-user :class:`asyncio.Lock` is held
+        for the entire compaction, so appends from other tasks
+        in the same process serialize behind it.  Cross-process
+        appenders are responsible for their own coordination —
+        compaction is a single-leader operation.
+
+        Returns :class:`CompactionStats` even on no-op compactions
+        (already-compact log) so a scheduler can detect them
+        cheaply via ``stats.bytes_saved == 0``.  Missing user
+        (no log file) is a no-op: ``before_lines == after_lines == 0``.
+        """
+        path = self._path_for(user_id)
+
+        def _run() -> CompactionStats:
+            if not path.exists():
+                return CompactionStats(
+                    user_id=user_id,
+                    before_lines=0,
+                    after_lines=0,
+                    before_bytes=0,
+                    after_bytes=0,
+                )
+            before_bytes = path.stat().st_size
+            before_lines = _count_lines(path)
+            live = self._load_records(path)
+
+            tmp_fd, tmp_path = tempfile.mkstemp(
+                prefix=f"{user_id}.",
+                suffix=".jsonl.tmp",
+                dir=str(self._base),
+            )
+            os.close(tmp_fd)
+            tmp = Path(tmp_path)
+            try:
+                # Write the live state as a sequence of ``add`` ops.
+                # Field order preserved to keep the on-disk layout
+                # readable and to make a diff between pre/post
+                # compaction comprehensible.
+                for record in live.values():
+                    entry = {
+                        "op": "add",
+                        "memory_id": record.memory_id,
+                        "user_id": record.user_id,
+                        "key": record.key,
+                        "value": record.value,
+                        "tags": list(record.tags),
+                        "created_at": record.created_at,
+                        "updated_at": record.updated_at,
+                    }
+                    self._append_line(tmp, entry)
+                # Atomic swap.  os.replace is the cross-platform
+                # spelling of POSIX rename(2) over an existing file.
+                os.replace(tmp, path)
+            except Exception:
+                # Cleanup the temp on any failure before the swap.
+                if tmp.exists():
+                    try:
+                        tmp.unlink()
+                    except OSError:
+                        pass
+                raise
+            after_bytes = path.stat().st_size
+            after_lines = len(live)
+            return CompactionStats(
+                user_id=user_id,
+                before_lines=before_lines,
+                after_lines=after_lines,
+                before_bytes=before_bytes,
+                after_bytes=after_bytes,
+            )
+
+        async with self._lock_for(user_id):
+            return await asyncio.to_thread(_run)
+
     async def list_users(self) -> list[str]:
         # Stem of every ``*.jsonl`` file under base_dir.  A file
         # that exists but parses to zero live records (every add
@@ -254,3 +373,18 @@ class FileMemoryStore(MemoryStore):
 
 def _list_user_ids(base: Path) -> list[str]:
     return sorted(p.stem for p in base.glob("*.jsonl"))
+
+
+def _count_lines(path: Path) -> int:
+    """Cheap line count without loading the file into memory.
+
+    Used by :meth:`FileMemoryStore.compact` to populate
+    ``CompactionStats.before_lines``.  Skips empty lines so the
+    count matches what the replay loop would actually process.
+    """
+    count = 0
+    with path.open("r", encoding="utf-8") as f:
+        for raw in f:
+            if raw.strip():
+                count += 1
+    return count
