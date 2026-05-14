@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import pytest
 
@@ -45,12 +45,13 @@ from ai_assistant_client.workflows.runtime import WorkflowEvent
 
 
 # ---------------------------------------------------------------------------
-# Helpers — open a real sqlite connection the way the factory does.
+# Helpers — sqlite connections come from the ``make_sqlite_conn``
+# fixture (see conftest.py) so the cleanup hook closes them on
+# teardown and pytest stays warning-free.
 # ---------------------------------------------------------------------------
 
 
-def _sqlite_conn(tmp_path: Path, name: str = "test.sqlite3") -> sqlite3.Connection:
-    return sqlite3.connect(tmp_path / name, check_same_thread=False)
+SqliteConnFactory = Callable[..., sqlite3.Connection]
 
 
 def _header(run_id: str = "run-1") -> RunHeader:
@@ -68,8 +69,8 @@ def _header(run_id: str = "run-1") -> RunHeader:
 # ---------------------------------------------------------------------------
 
 
-async def test_transcript_header_event_footer_round_trip(tmp_path: Path) -> None:
-    conn = _sqlite_conn(tmp_path)
+async def test_transcript_header_event_footer_round_trip(make_sqlite_conn: SqliteConnFactory) -> None:
+    conn = make_sqlite_conn()
     store = SqlTranscriptStore(conn, dialect=Dialect.SQLITE)
 
     h = _header()
@@ -92,8 +93,8 @@ async def test_transcript_header_event_footer_round_trip(tmp_path: Path) -> None
     assert transcript.footer.outcome == "result"
 
 
-async def test_transcript_partial_run_has_no_footer(tmp_path: Path) -> None:
-    conn = _sqlite_conn(tmp_path)
+async def test_transcript_partial_run_has_no_footer(make_sqlite_conn: SqliteConnFactory) -> None:
+    conn = make_sqlite_conn()
     store = SqlTranscriptStore(conn, dialect=Dialect.SQLITE)
 
     await store.write_header(_header())
@@ -107,9 +108,9 @@ async def test_transcript_partial_run_has_no_footer(tmp_path: Path) -> None:
 
 
 async def test_transcript_duplicate_header_raises_value_error(
-    tmp_path: Path,
+    make_sqlite_conn: SqliteConnFactory,
 ) -> None:
-    conn = _sqlite_conn(tmp_path)
+    conn = make_sqlite_conn()
     store = SqlTranscriptStore(conn, dialect=Dialect.SQLITE)
 
     await store.write_header(_header())
@@ -118,9 +119,9 @@ async def test_transcript_duplicate_header_raises_value_error(
 
 
 async def test_transcript_append_to_unknown_run_raises_key_error(
-    tmp_path: Path,
+    make_sqlite_conn: SqliteConnFactory,
 ) -> None:
-    conn = _sqlite_conn(tmp_path)
+    conn = make_sqlite_conn()
     store = SqlTranscriptStore(conn, dialect=Dialect.SQLITE)
     with pytest.raises(KeyError):
         await store.append_event(
@@ -129,9 +130,9 @@ async def test_transcript_append_to_unknown_run_raises_key_error(
 
 
 async def test_transcript_footer_for_unknown_run_raises_key_error(
-    tmp_path: Path,
+    make_sqlite_conn: SqliteConnFactory,
 ) -> None:
-    conn = _sqlite_conn(tmp_path)
+    conn = make_sqlite_conn()
     store = SqlTranscriptStore(conn, dialect=Dialect.SQLITE)
     with pytest.raises(KeyError):
         await store.write_footer(
@@ -140,15 +141,15 @@ async def test_transcript_footer_for_unknown_run_raises_key_error(
         )
 
 
-async def test_transcript_read_unknown_raises_key_error(tmp_path: Path) -> None:
-    conn = _sqlite_conn(tmp_path)
+async def test_transcript_read_unknown_raises_key_error(make_sqlite_conn: SqliteConnFactory) -> None:
+    conn = make_sqlite_conn()
     store = SqlTranscriptStore(conn, dialect=Dialect.SQLITE)
     with pytest.raises(KeyError):
         await store.read("nope")
 
 
-async def test_transcript_list_runs(tmp_path: Path) -> None:
-    conn = _sqlite_conn(tmp_path)
+async def test_transcript_list_runs(make_sqlite_conn: SqliteConnFactory) -> None:
+    conn = make_sqlite_conn()
     store = SqlTranscriptStore(conn, dialect=Dialect.SQLITE)
     await store.write_header(_header("run-a"))
     await store.write_header(_header("run-b"))
@@ -156,11 +157,13 @@ async def test_transcript_list_runs(tmp_path: Path) -> None:
     assert set(runs) == {"run-a", "run-b"}
 
 
-async def test_transcript_survives_reopen(tmp_path: Path) -> None:
+async def test_transcript_survives_reopen(
+    make_sqlite_conn: SqliteConnFactory,
+) -> None:
     """Data written via one connection is visible through a
     fresh connection to the same file — the durability win
     over the file backend is the whole point of using SQL."""
-    conn1 = _sqlite_conn(tmp_path)
+    conn1 = make_sqlite_conn()
     store1 = SqlTranscriptStore(conn1, dialect=Dialect.SQLITE)
     await store1.write_header(_header("run-x"))
     await store1.append_event(
@@ -168,7 +171,7 @@ async def test_transcript_survives_reopen(tmp_path: Path) -> None:
     )
     conn1.close()
 
-    conn2 = _sqlite_conn(tmp_path)
+    conn2 = make_sqlite_conn()
     store2 = SqlTranscriptStore(conn2, dialect=Dialect.SQLITE)
     transcript = await store2.read("run-x")
     assert transcript.events[0].value == 42
@@ -179,8 +182,8 @@ async def test_transcript_survives_reopen(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_conversation_round_trip(tmp_path: Path) -> None:
-    conn = _sqlite_conn(tmp_path)
+async def test_conversation_round_trip(make_sqlite_conn: SqliteConnFactory) -> None:
+    conn = make_sqlite_conn()
     store = SqlConversationStore(conn, dialect=Dialect.SQLITE)
 
     await store.append("conv-1", {"role": "user", "content": "hi"})
@@ -195,14 +198,14 @@ async def test_conversation_round_trip(tmp_path: Path) -> None:
     ]
 
 
-async def test_conversation_read_unknown_returns_empty(tmp_path: Path) -> None:
-    conn = _sqlite_conn(tmp_path)
+async def test_conversation_read_unknown_returns_empty(make_sqlite_conn: SqliteConnFactory) -> None:
+    conn = make_sqlite_conn()
     store = SqlConversationStore(conn, dialect=Dialect.SQLITE)
     assert await store.read("never-written") == []
 
 
-async def test_conversation_list_conversations(tmp_path: Path) -> None:
-    conn = _sqlite_conn(tmp_path)
+async def test_conversation_list_conversations(make_sqlite_conn: SqliteConnFactory) -> None:
+    conn = make_sqlite_conn()
     store = SqlConversationStore(conn, dialect=Dialect.SQLITE)
     await store.append("conv-a", {"role": "user", "content": "x"})
     await store.append("conv-b", {"role": "user", "content": "y"})
@@ -210,11 +213,13 @@ async def test_conversation_list_conversations(tmp_path: Path) -> None:
     assert set(convs) == {"conv-a", "conv-b"}
 
 
-async def test_conversation_preserves_insert_order(tmp_path: Path) -> None:
+async def test_conversation_preserves_insert_order(
+    make_sqlite_conn: SqliteConnFactory,
+) -> None:
     """The seq column drives the read ORDER BY — ten messages
     inserted in order must come back in order even if sqlite
     physical-storage order is permuted."""
-    conn = _sqlite_conn(tmp_path)
+    conn = make_sqlite_conn()
     store = SqlConversationStore(conn, dialect=Dialect.SQLITE)
     for i in range(10):
         await store.append("conv-1", {"role": "user", "content": f"msg-{i}"})

@@ -161,6 +161,32 @@ async def test_graph_sequence_kind(
     assert captured.out.startswith("sequenceDiagram")
 
 
+async def test_graph_gantt_kind(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """End-to-end CLI dispatch for the Gantt diagram kind — the
+    renderer itself is covered by ``test_workflow_graph_gantt.py``;
+    this test catches breakage in the CLI's ``--kind`` parsing or
+    plumbing into the renderer."""
+    base = tmp_path / "transcripts"
+    await _seed_transcript(base)
+    monkeypatch.setenv(TRANSCRIPT_BACKEND_ENV, "file")
+    monkeypatch.setenv(TRANSCRIPT_DIR_ENV, str(base))
+
+    rc = await _cli_graph("run-cli-1", kind="gantt")
+    captured = capsys.readouterr()
+
+    assert rc == 0
+    assert captured.out.startswith("gantt")
+    # Mermaid Gantt requires a dateFormat directive.
+    assert "dateFormat" in captured.out
+    # Seed transcript stamped events with 2026-05-14 timestamps;
+    # they should reach the chart.
+    assert "2026-05-14" in captured.out
+
+
 async def test_graph_unknown_run_id_exits_nonzero(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -216,3 +242,24 @@ def test_main_graph_dispatches_to_cli_graph(
     rc = app.main(["graph", "abc-123", "--kind", "sequence"])
     assert rc == 0
     assert called_with == {"run_id": "abc-123", "kind": "sequence"}
+
+
+def test_main_graph_accepts_gantt_kind(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """argparse's ``choices`` rejects unknown ``--kind`` values
+    with SystemExit; this test pins down that ``gantt`` is on
+    the allowed list so the renderer's third kind is actually
+    reachable through the CLI."""
+    from ai_assistant_client import app
+
+    captured: dict[str, str] = {}
+
+    async def fake_graph(run_id: str, *, kind: str) -> int:
+        captured["kind"] = kind
+        return 0
+
+    monkeypatch.setattr(app, "_cli_graph", fake_graph)
+    rc = app.main(["graph", "abc-123", "--kind", "gantt"])
+    assert rc == 0
+    assert captured["kind"] == "gantt"
