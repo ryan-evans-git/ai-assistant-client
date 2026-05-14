@@ -88,7 +88,10 @@ from ai_assistant_client.persistence.transcript import (
     TranscriptStore,
 )
 from ai_assistant_client.persistence.user_memory import Memory, MemoryStore
-from ai_assistant_client.persistence.user_memory_file import FileMemoryStore
+from ai_assistant_client.persistence.user_memory_file import (
+    CompactionStats,
+    FileMemoryStore,
+)
 from ai_assistant_client.persistence.user_memory_local import LocalMemoryStore
 
 
@@ -102,6 +105,7 @@ __all__ = [
     "CONVERSATION_BACKEND_ENV",
     "CONVERSATION_DIR_ENV",
     "CONVERSATION_SQLITE_PATH_ENV",
+    "CompactionStats",
     "ConversationStore",
     "Dialect",
     "FileConversationStore",
