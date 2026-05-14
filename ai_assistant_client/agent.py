@@ -22,8 +22,9 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Literal
 
 from ai_assistant_client.confirmation_store import ConfirmationOutcome
 from ai_assistant_client.discovery import ProgressiveToolRegistry
-from ai_assistant_client.persistence import ConversationStore
+from ai_assistant_client.persistence import ConversationStore, TranscriptStore
 from ai_assistant_client.workflows import WorkflowRegistry, run_workflow
+from ai_assistant_client.workflows.replay import run_workflow_recording
 from ai_assistant_client.llm import (
     CacheHint,
     LLMProvider,
@@ -146,6 +147,7 @@ async def run_agent(
     workflow_registry: WorkflowRegistry | None = None,
     conversation_store: ConversationStore | None = None,
     conversation_id: str | None = None,
+    transcript_store: TranscriptStore | None = None,
 ) -> AsyncIterator[AgentEvent]:
     """Run one user turn end-to-end.
 
@@ -175,6 +177,13 @@ async def run_agent(
     store-read path stays a host-side decision, not a hidden
     side-effect of ``run_agent``).  Either ``None`` disables
     persistence entirely.
+
+    ``transcript_store``: when set, every workflow dispatched
+    inside this turn is recorded via
+    :func:`run_workflow_recording`.  Run ids are auto-generated
+    as ``wf_{workflow_name}_{uuid}`` so they're human-recognisable
+    in store listings.  ``None`` (the default) keeps the
+    pre-recording dispatch path unchanged.
 
     History is stored in Anthropic-style block form regardless of
     which provider is in use; each provider adapter translates on
@@ -396,14 +405,36 @@ async def run_agent(
                         assert wf is not None  # guarded by is_workflow_call
                         wf_value: Any = None
                         wf_error: str | None = None
-                        async for wf_event in run_workflow(
-                            wf,
-                            tool_input if isinstance(tool_input, dict) else {},
-                            tool_use_id=tu_id,
-                            confirmation_hook=confirmation_hook,
-                            default_timeout_seconds=config.confirmation_default_timeout_seconds,
-                            on_timeout_decision=config.confirmation_on_timeout,
-                        ):
+                        # Pick recording vs. plain dispatch based on
+                        # whether the host wired in a transcript
+                        # store.  Both return the same event
+                        # AsyncIterator shape, so the rest of the
+                        # loop is identical.
+                        wf_args = (
+                            tool_input if isinstance(tool_input, dict) else {}
+                        )
+                        if transcript_store is not None:
+                            run_id = f"wf_{wf.name}_{uuid.uuid4().hex}"
+                            wf_iter = run_workflow_recording(
+                                wf,
+                                wf_args,
+                                tool_use_id=tu_id,
+                                confirmation_hook=confirmation_hook,
+                                store=transcript_store,
+                                run_id=run_id,
+                                default_timeout_seconds=config.confirmation_default_timeout_seconds,
+                                on_timeout_decision=config.confirmation_on_timeout,
+                            )
+                        else:
+                            wf_iter = run_workflow(
+                                wf,
+                                wf_args,
+                                tool_use_id=tu_id,
+                                confirmation_hook=confirmation_hook,
+                                default_timeout_seconds=config.confirmation_default_timeout_seconds,
+                                on_timeout_decision=config.confirmation_on_timeout,
+                            )
+                        async for wf_event in wf_iter:
                             if wf_event.type == "status":
                                 yield AgentEvent(
                                     "workflow_status", wf_event.payload or {}
