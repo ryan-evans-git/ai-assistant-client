@@ -328,6 +328,26 @@ events + outcome). It does **not** mock tool calls inside the
 handler — for that, write the workflow to inject its tool
 dependencies and pass mocks at test time.
 
+### Visualize a recorded run
+
+Any `RunTranscript` (in-memory, file, or SQL backend) renders to
+a Mermaid diagram — useful for embedding in PR descriptions,
+runbooks, or static documentation:
+
+```python
+from ai_assistant_client.workflows.graph import transcript_to_mermaid
+
+transcript = await store.read("run-2026-05-14-...")
+print(transcript_to_mermaid(transcript))               # flowchart (default)
+print(transcript_to_mermaid(transcript, kind="sequence"))
+```
+
+The output is a self-contained Mermaid block — wrap it in
+` ```mermaid … ``` ` fences and GitHub / GitLab / Notion will
+render it natively. Confirmation pauses become decision
+diamonds; `result` and `error` terminal nodes carry style
+classes so successes and failures are visually distinct.
+
 ## Conversation history persistence
 
 `run_agent` accepts an optional `(conversation_store, conversation_id)`
