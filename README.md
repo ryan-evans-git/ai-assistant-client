@@ -284,6 +284,50 @@ See `workflows/sample.py` for runnable examples
 (`approve_and_send_email`, `draft_review_send_email`,
 `bulk_archive_with_review`).
 
+### Record & replay
+
+Workflow runs can be recorded to a pluggable transcript store and
+replayed later — useful for regression tests, demos, and forensic
+"what actually happened in run X" inspection.
+
+```python
+from ai_assistant_client.persistence import make_transcript_store
+from ai_assistant_client.workflows.replay import (
+    replay_workflow, run_workflow_recording,
+)
+
+store = make_transcript_store()  # default: in-memory
+
+# Record:
+async for event in run_workflow_recording(
+    wf, args, tool_use_id="tu", confirmation_hook=hook,
+    store=store, run_id="run-2026-05-14-...",
+):
+    ...
+
+# Replay (handler is NOT re-invoked; events come from the store):
+async for event in replay_workflow(store, "run-2026-05-14-..."):
+    ...
+```
+
+Pick the backend by env var:
+
+| Env var | Values | Notes |
+|---|---|---|
+| `AAC_TRANSCRIPT_BACKEND` | `memory` *(default)* / `file` | More backends (managed cloud DBs, OLTP) plug in later under the same protocol. |
+| `AAC_TRANSCRIPT_DIR` | path | Base directory for the `file` backend; defaults to `./transcripts`. One `.jsonl` file per run id. |
+
+The same `TranscriptStore` abstraction is the seed for upcoming
+conversation-history and per-user-memory persistence — adding a
+new backend (SQL on a local sqlite, SQL on a managed cloud DB,
+etc.) is one class implementing the protocol; no application
+code changes.
+
+Replay records the workflow boundary (input args + emitted
+events + outcome). It does **not** mock tool calls inside the
+handler — for that, write the workflow to inject its tool
+dependencies and pass mocks at test time.
+
 ## Visuals (charts, tables, KPI tiles, images)
 
 The model can render structured visuals in the host UI by calling the
