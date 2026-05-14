@@ -317,16 +317,51 @@ Pick the backend by env var:
 | `AAC_TRANSCRIPT_BACKEND` | `memory` *(default)* / `file` | More backends (managed cloud DBs, OLTP) plug in later under the same protocol. |
 | `AAC_TRANSCRIPT_DIR` | path | Base directory for the `file` backend; defaults to `./transcripts`. One `.jsonl` file per run id. |
 
-The same `TranscriptStore` abstraction is the seed for upcoming
-conversation-history and per-user-memory persistence — adding a
-new backend (SQL on a local sqlite, SQL on a managed cloud DB,
-etc.) is one class implementing the protocol; no application
-code changes.
+A parallel `ConversationStore` (below) handles open-ended chat
+history. Adding a new backend (SQL on a local sqlite, SQL on a
+managed cloud DB, etc.) is one class implementing the relevant
+protocol; no application code changes.
 
 Replay records the workflow boundary (input args + emitted
 events + outcome). It does **not** mock tool calls inside the
 handler — for that, write the workflow to inject its tool
 dependencies and pass mocks at test time.
+
+## Conversation history persistence
+
+`run_agent` accepts an optional `(conversation_store, conversation_id)`
+pair. When both are set, every message the agent appends to
+`history` (the user turn, each assistant turn, each tool_result
+turn, validation-retry feedback) is mirrored into the store
+under that id:
+
+```python
+from ai_assistant_client.persistence import make_conversation_store
+
+store = make_conversation_store()  # default: in-memory
+async for event in run_agent(
+    user_message="hello",
+    history=await store.read("conv-123"),  # seed from prior turns
+    ...,
+    conversation_store=store,
+    conversation_id="conv-123",
+):
+    ...
+```
+
+The store is **write-only from the agent's perspective** — seeding
+`history` from prior turns is the caller's responsibility (so
+the read path stays a host-side decision, not a hidden side
+effect). When `conversation_store` or `conversation_id` is
+`None`, persistence is silently disabled.
+
+Pick the backend by env var, independently from the transcript
+store:
+
+| Env var | Values | Notes |
+|---|---|---|
+| `AAC_CONVERSATION_BACKEND` | `memory` *(default)* / `file` | More backends (SQL on local sqlite, managed cloud DBs, OLTP) plug in later under the same protocol. |
+| `AAC_CONVERSATION_DIR` | path | Base directory for the `file` backend; defaults to `./conversations`. One `.jsonl` file per conversation id. |
 
 ## Visuals (charts, tables, KPI tiles, images)
 
