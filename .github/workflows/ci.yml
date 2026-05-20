@@ -59,7 +59,19 @@ jobs:
         # dependency tree. `--skip-editable` excludes the in-tree
         # `ai-assistant-client` install (pip-audit can't look up
         # an editable local install on PyPI).
-        run: pip-audit --skip-editable
+        #
+        # Ignored advisories (review periodically — a real fix or
+        # un-dispute should remove the entry):
+        #
+        #   PYSEC-2025-183 / CVE-2025-45768 — pyjwt "weak encryption."
+        #     Disputed by the supplier: the key length is chosen by
+        #     the application using the library, not by pyjwt itself,
+        #     and there is no fix version (the advisory's affected
+        #     range is [introduced=0, no fixed]).  ai-assistant-client
+        #     does not directly use pyjwt for JWT signing; it pulls
+        #     in transitively (via boto3/botocore for AWS auth).
+        #     Refs: https://api.osv.dev/v1/vulns/PYSEC-2025-183
+        run: pip-audit --skip-editable --ignore-vuln PYSEC-2025-183
 
       - name: License check (block GPL/AGPL/SSPL/BUSL/Elastic)
         # Substring match against each dep's license string.  Exact
