@@ -15,6 +15,102 @@ client/v1
 └── GET  /healthz
 ```
 
+## Architecture
+
+A single Starlette process hosts the SSE endpoint, the per-turn agent
+loop, and the MCP pool that routes tool calls to upstream servers.
+The LLM is reached through a thin `LLMProvider` adapter so the loop
+stays identical across Anthropic / OpenAI / Gemini / Bedrock.
+Everything reached by a dashed arrow below is **optional** and
+disabled unless the host wires it in.
+
+```mermaid
+flowchart LR
+  UI["Host UI"]:::ext
+
+  subgraph Service["ai-assistant-client (Starlette)"]
+    direction TB
+    APP["app.py<br/>POST /chat (SSE)<br/>POST /chat/confirm"]
+    AGENT["agent.run_agent<br/>per-turn loop"]
+    REG["ProgressiveToolRegistry<br/>tool_search · tool_load"]
+    POOL["McpPool"]
+    APP --> AGENT
+    AGENT --> REG
+    AGENT --> POOL
+  end
+
+  LLM["LLMProvider<br/>anthropic · openai · gemini · bedrock"]:::ext
+  MCP["Upstream MCP servers<br/>stdio · SSE"]:::ext
+
+  CONF[("Confirmation store<br/>in-memory · Redis")]:::store
+  PER[("Persistence (optional)<br/>transcripts · conversations · memory<br/>memory · file · Postgres · MySQL")]:::store
+  WF["workflows.runtime<br/>(optional)"]:::opt
+  VAL["validation orchestrator<br/>citations + auditor (optional)"]:::opt
+
+  UI <-->|SSE| APP
+  AGENT <--> LLM
+  POOL <--> MCP
+  AGENT -. HITL pause .-> CONF
+  AGENT -. record / replay .-> PER
+  AGENT -. dispatch .-> WF
+  AGENT -. hybrid verify .-> VAL
+
+  classDef ext fill:#eef2ff,stroke:#6366f1,color:#1e1b4b
+  classDef store fill:#fef9c3,stroke:#ca8a04,color:#422006
+  classDef opt fill:#f1f5f9,stroke:#64748b,color:#0f172a,stroke-dasharray: 4 2
+```
+
+### One turn, end to end
+
+The loop is **search → load → invoke**: the model first calls
+`tool_search` to discover what's available, then `tool_load` to pull
+the relevant schemas into context, then the real upstream tool. Only
+the meta-tools are present on turn one — the rest of the catalog
+never enters the prompt unless the model asks for it.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  actor User
+  participant App as Starlette app
+  participant Agent as run_agent
+  participant Reg as ProgressiveToolRegistry
+  participant LLM as LLM provider
+  participant Pool as McpPool
+  participant MCP as Upstream MCP
+
+  User->>App: POST /chat
+  App->>Agent: run_agent(prompt, history)
+  Note over Agent,LLM: System prompt +<br/>tool_search · tool_load only<br/>(no full catalog)
+  Agent->>LLM: stream messages + meta-tools
+
+  loop until stop_reason ≠ tool_use
+    LLM-->>Agent: text deltas + tool_use
+    alt tool_search
+      Agent->>Reg: search(query)
+      Reg-->>Agent: top-N matches
+    else tool_load
+      Agent->>Reg: load(names)
+      Reg-->>Agent: schemas (now callable next turn)
+    else upstream tool
+      Agent->>Pool: call_tool(name, args)
+      Pool->>MCP: invoke
+      MCP-->>Pool: result
+      Pool-->>Agent: result
+    end
+    Agent->>LLM: tool_result → next turn
+  end
+
+  LLM-->>Agent: final text deltas + stop
+  Agent-->>App: SSE events (text · tool · visual · done)
+  App-->>User: text/event-stream
+```
+
+The agent loop lives in [`ai_assistant_client/agent.py`](ai_assistant_client/agent.py);
+provider adapters in [`ai_assistant_client/llm/`](ai_assistant_client/llm);
+the MCP pool in [`ai_assistant_client/mcp_pool.py`](ai_assistant_client/mcp_pool.py);
+the registry in [`ai_assistant_client/discovery.py`](ai_assistant_client/discovery.py).
+
 ## Why progressive discovery
 
 A naive MCP integration loads every upstream tool's schema into the system
