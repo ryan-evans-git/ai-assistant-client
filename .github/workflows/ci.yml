@@ -25,7 +25,7 @@ jobs:
       matrix:
         python: ["3.11", "3.12"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-python@v5
         with:
@@ -92,7 +92,7 @@ jobs:
     runs-on: ubuntu-latest
     # Independent of the Python matrix — runs once per push/PR.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Trivy filesystem scan
         # Catches CVEs in OS packages declared in the repo + any
@@ -126,6 +126,6 @@ jobs:
     # Builds the image but doesn't push — just confirms the
     # Dockerfile still resolves and the layer graph is sane.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build image
         run: docker build -t ai-assistant-client:ci .
